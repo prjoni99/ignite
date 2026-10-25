@@ -162,6 +162,8 @@ month. A corrupt `<library root>/.scribe-daily/daily.json` shows an error and
 creates nothing; `<library root>/.scribe-capture/capture.json` tracks the
 Inbox the same way. `Couldn't open the Inbox.` means the capture failed.
 
+**Side-button capture.** With `SIDE BUTTON` set to `Capture` in Preferences, pressing the pen's side button and touching the page jumps to a fresh Inbox page. The same gesture on that Inbox page returns to the notebook and page you came from, or to Home when the capture started there.
+
 **An empty capture page vanished.** By design: leaving a capture page
 discards it if nothing was written, it has no links or text beyond the stamp,
 and it is not the Inbox's only page.

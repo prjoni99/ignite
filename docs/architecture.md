@@ -155,6 +155,10 @@ that sync normally.
   page in a top-level notebook titled `Inbox` (created on first use), stamped
   with the time (`Sun 25 Oct 17:40`; skipped when the clock is unset).
   Tracked by id in `<library root>/.scribe-capture/capture.json`.
+- Gesture: with the side-button action set to `Capture`, pressing the pen's side
+  button and touching the page jumps to a fresh Inbox page. The same gesture on
+  that Inbox page returns to the notebook and page you came from, or to Home
+  when the capture started there.
 - Leaving a capture page discards it if nothing was written, it has no links
   and no text beyond the stamp, and it is not the Inbox's only page. Other
   Inbox pages are never touched.
