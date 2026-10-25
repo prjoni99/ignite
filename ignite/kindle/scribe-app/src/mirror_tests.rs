@@ -516,6 +516,30 @@ fn ensure_folder_recreates_when_the_user_deleted_it() {
     assert_eq!(l.data.amazon_folder.as_deref(), Some(b.as_str()));
 }
 
+#[test]
+fn ensure_folder_adopts_an_existing_folder_with_the_mirror_title_when_the_ledger_has_none() {
+    // Restore from Server replaces the library: the `Amazon` folder comes back, the ledger
+    // does not. The next mirror reuses that folder instead of creating a second `Amazon`.
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let mut f = crate::folders::FolderStore::open(s.lib.root());
+    let live = s.lib.manifest().notebook_ids.clone();
+    let other = f.create("Work", &live).unwrap();
+    let restored = f.create(AMAZON_FOLDER_TITLE, &live).unwrap();
+    let count = f.view(&live).len();
+    let a = ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap();
+    assert_eq!(a, restored);
+    assert_ne!(a, other);
+    assert_eq!(f.view(&live).len(), count, "no folder created");
+    assert_eq!(l.data.amazon_folder.as_deref(), Some(restored.as_str()));
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, l.data);
+    // Only an exact title matches; `Removed from Amazon` is still created when absent.
+    let r = ensure_folder(&mut l, &mut f, &live, Which::Removed, &NoSync).unwrap();
+    assert_ne!(r, restored);
+    assert_eq!(f.title(&r), Some(REMOVED_FOLDER_TITLE));
+    assert_eq!(f.view(&live).len(), count + 1);
+}
+
 fn two_page_notebook(s: &mut Scribe, id: &str) -> PathBuf {
     let g = geo();
     let cancel = std::sync::atomic::AtomicBool::new(false);

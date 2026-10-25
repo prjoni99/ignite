@@ -529,8 +529,10 @@ pub enum Which {
 }
 
 /// The local folder for `which`: the ledger-recorded id while the folder still exists (a user
-/// rename keeps it), otherwise a freshly created one (the user deleted it), captured for sync
-/// and recorded in the ledger.
+/// rename keeps it); otherwise an existing folder titled exactly as the mirror would title it
+/// (a Restore from Server brings the folder back but not the ledger: reuse it rather than
+/// make a second `Amazon`); otherwise a freshly created one (the user deleted it), captured
+/// for sync. Either way the id is recorded in the ledger.
 pub(crate) fn ensure_folder(
     ledger: &mut MirrorLedger,
     folders: &mut FolderStore,
@@ -547,8 +549,19 @@ pub(crate) fn ensure_folder(
             return Ok(id.clone());
         }
     }
-    let id = folders.create(title, live)?;
-    sync.folder_changed(folders, FolderCapture::Created(id.clone()));
+    let existing = folders
+        .view(live)
+        .into_iter()
+        .find(|f| f.title == title)
+        .map(|f| f.id);
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = folders.create(title, live)?;
+            sync.folder_changed(folders, FolderCapture::Created(id.clone()));
+            id
+        }
+    };
     let (amazon, removed) = match which {
         Which::Amazon => (Some(id.clone()), ledger.data.removed_folder.clone()),
         Which::Removed => (ledger.data.amazon_folder.clone(), Some(id.clone())),
