@@ -59,7 +59,10 @@ browser companion.
   one entry per source UUID: state `current`, `rebuilding`, `removed` or
   `unsupported`, source stamp (size + mtime of `nbk` and `actions.log`) and
   content hash. A corrupt ledger fails closed: the mirror pauses and nothing
-  is created or removed.
+  is created or removed. A missing notebooks root or catalog likewise pauses
+  the mirror; a source the catalog still lists but whose directory or `nbk`
+  is missing is skipped, not removed. Only a source the catalog drops (or
+  marks deleted) moves to `Removed from Amazon`.
 - Cadence: a stat-only scan runs at launch, after each completed sync upload
   batch and every 15 minutes. A rebuild (decode + ordinary sync operations)
   runs one notebook per loop iteration. A scan runs only while Home or Tools is
@@ -70,16 +73,20 @@ browser companion.
   (same backpressure as "Import Kindle notebooks"). A crash mid-rebuild is
   cleaned up at next launch (partial mirror removed via the synced delete path,
   recreated by the next scan); never more than one mirror per source.
-- Read-only: on the Kindle, pen/eraser, undo, page add/move/delete, link
-  add/remove, lasso moves and rename are refused with `This notebook mirrors
-  Amazon and is read-only. Use Copy to Ignite from Home.` In the browser
-  companion, a notebook in a folder titled exactly `Amazon` shows `Mirrored
-  from Amazon. Read-only here; write in Ignite or copy it on the Kindle.` and
-  offers no Write/Type tools; moving it out lifts the convention (the next
-  rebuild files it back).
+- Read-only: on the Kindle, an open mirror refuses pen/eraser, undo, page
+  add/move/delete, link add/remove, lasso moves and rename with a
+  `Read-only mirror` notice (`This notebook mirrors Amazon and is read-only.
+  Use Copy to Ignite from Home.`). A mirror's Home card menu offers only
+  `COPY TO IGNITE` and `DELETE` (a deleted mirror is recreated at the
+  source's next change). In the browser companion, a notebook in a folder
+  titled exactly `Amazon` shows `Mirrored from Amazon. Read-only here; write
+  in Ignite or copy it on the Kindle.` and offers no Write/Type tools or page
+  insert/delete. Renaming the `Amazon` folder or moving a notebook out of it
+  (browser or Kindle folder commands) lifts the browser's read-only
+  treatment; ink or text added afterwards is discarded at the next rebuild.
 - Copy to Ignite: the Home card menu runs the existing one-way import to make
-  an editable copy; a source is copied at most once (`Already copied to
-  Ignite.` afterwards).
+  an editable copy; a source is copied at most once (an `Already copied`
+  notice afterwards).
 - Setting: Preferences → `AMAZON MIRROR` (`mirror_amazon` in replica-local
   `preferences.json`, default on). Tools shows status and `RESCAN NOW`.
 

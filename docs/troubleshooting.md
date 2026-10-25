@@ -122,6 +122,17 @@ sync is linked. See `docs/architecture.md`.
 **Nothing happens while writing.** Expected: the mirror does nothing with a page
 open.
 
+**Mirror paused, nothing removed.** If the notebooks root or catalog is
+missing (storage not mounted), or a listed source's directory or `nbk` is
+missing, the mirror takes no action for it rather than removing anything.
+
+**Can't edit a mirror.** On the Kindle an open mirror refuses edits with a
+`Read-only mirror` notice, and its card menu offers only `COPY TO IGNITE` and
+`DELETE`. Use Copy to Ignite for an editable notebook. Renaming the `Amazon`
+folder or moving a notebook out of it (browser or Kindle) lifts the browser's
+read-only treatment, but any ink or text added afterwards is discarded at the
+next rebuild.
+
 **Removed from Amazon.** The source was deleted on the Kindle; its mirror is
 kept there, never deleted. It returns to `Amazon` if the source reappears. A
 mirror you deleted in Ignite is recreated at the source's next change.

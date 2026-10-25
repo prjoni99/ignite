@@ -85,7 +85,7 @@ the way to get an editable Ignite copy.
 
 - **Separate notebooks in a reserved folder, not in-place re-import.** The existing copy-once receipts
   stay as they are. Mirror state lives in its own ledger
-  (`<data-dir>/.scribe-mirror/ledger.json`, beside the existing `.scribe-import/`) keyed `amazon_nbk:<uuid>`, recording
+  (`<data-dir>/.scribe-mirror/ledger.json`, beside the existing `.scribe-import/`) keyed by the catalog UUID (`origin_kind: amazon_nbk` is recorded in each mirror's `mirror-origin.json` marker), recording
   the source stamp (size + mtime of `nbk` and `actions.log`) and the content
   hash of the last decoded snapshot.
 - **Read-only by convention, no protocol change.** On the Kindle each mirror
