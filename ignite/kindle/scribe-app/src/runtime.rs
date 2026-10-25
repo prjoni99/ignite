@@ -2197,6 +2197,12 @@ struct UiExec<'a> {
     stop: &'a Arc<AtomicBool>,
     /// NBK import in progress (Tools screen); one source per idle loop pass.
     import_run: &'a mut Option<ImportRun>,
+    /// Amazon mirror rebuild pass in progress; one action per idle loop pass (Home/Tools).
+    mirror_run: &'a mut Option<crate::mirror::MirrorRun>,
+    /// The bound notebook mirrors Amazon: pen and eraser contacts on its pages are discarded.
+    session_read_only: &'a mut bool,
+    /// The read-only hint was already shown since the notebook was opened.
+    read_only_hint_shown: &'a mut bool,
     /// Replica-local preferences.json (outside the library).
     prefs_path: &'a Path,
     /// `--sync-dir` (Restore from Server replaces it with the library).
@@ -2345,6 +2351,97 @@ fn import_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
         *x.import_run = None;
     }
     present_ui(x, ctrl, None)
+}
+
+/// One-line modal shown the first time a pen touches a mirror notebook page after it opens.
+const READ_ONLY_HINT: &str =
+    "This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.";
+
+/// The notebook in `dir` is an Amazon mirror (read-only on the page).
+fn is_mirror_notebook_dir(dir: &Path) -> bool {
+    dir.join(crate::mirror::MIRROR_MARKER).is_file()
+}
+
+/// Apply the next queued Amazon mirror action. Runs only at the structural safe point and only
+/// where [`crate::mirror::step_allowed`] admits it (Home/Tools), never with a page open.
+fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    use crate::mirror::{apply_one, kindle_decode, MirrorLedger, MirrorOutcome, MirrorTarget};
+    use crate::nbk_import::{GlobalSync, ImportTarget};
+    let Some(run) = x.mirror_run.as_mut() else {
+        return Ok(());
+    };
+    let Some(action) = run.queue.pop_front() else {
+        *x.mirror_run = None;
+        return Ok(());
+    };
+    let paper = paper_background(&x.geo);
+    let t0 = Instant::now();
+    let outcome = match MirrorLedger::open(x.library.root()) {
+        Ok(mut ledger) => {
+            let mut target = MirrorTarget {
+                import: ImportTarget {
+                    library: &mut *x.library,
+                    profile: &*x.notebook_profile,
+                    geo: &x.geo,
+                    paper: &paper,
+                    cancel: x.stop,
+                },
+                folders: &mut *x.folders,
+            };
+            apply_one(
+                &mut target,
+                &mut ledger,
+                &action,
+                &kindle_decode,
+                &GlobalSync,
+            )
+        }
+        // An unreadable ledger fails closed for every action: stop the run.
+        Err(e) => MirrorOutcome::Halted(e),
+    };
+    let ms = t0.elapsed().as_millis();
+    let (label, detail) = match &outcome {
+        MirrorOutcome::Done => ("done", ""),
+        MirrorOutcome::Skipped(m) => ("skipped", m.as_str()),
+        MirrorOutcome::Failed(m) => ("failed", m.as_str()),
+        MirrorOutcome::Halted(m) => ("halted", m.as_str()),
+    };
+    println!(
+        "mirror_step action={} origin={} outcome={label} ms={ms} detail={detail}",
+        action.kind(),
+        action.origin_id()
+    );
+    let finished = match outcome {
+        MirrorOutcome::Done => {
+            run.done += 1;
+            run.queue.is_empty()
+        }
+        MirrorOutcome::Skipped(_) => run.queue.is_empty(),
+        MirrorOutcome::Failed(m) => {
+            run.failed.push((action.origin_id().to_string(), m));
+            run.queue.is_empty()
+        }
+        MirrorOutcome::Halted(_) => {
+            println!(
+                "mirror_run_halted done={} failed={} not_started={}",
+                run.done,
+                run.failed.len(),
+                run.queue.len()
+            );
+            *x.mirror_run = None;
+            return Ok(());
+        }
+    };
+    if finished {
+        let done = run.done;
+        println!("mirror_run_done done={done} failed={}", run.failed.len());
+        *x.mirror_run = None;
+        // Home lists notebooks and folders: show the mirrored result once, not per action.
+        if done > 0 && x.ui.view == AppView::Home && !x.ui.modal_open() {
+            return present_ui(x, ctrl, None);
+        }
+    }
+    Ok(())
 }
 
 /// Kindle home (Library) app. appmgrd switching to it pauses/unloads `com.markrai.ignite`;
@@ -2631,6 +2728,7 @@ fn reload_after_inbound(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(),
     .map_err(|e| format!("bind page: {e}"))?;
     *x.notebook_dir = new_dir;
     *x.manifest = opened.manifest;
+    *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
     *x.notebook_profile = profile;
@@ -2667,6 +2765,7 @@ fn install_active_notebook(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<
     )?;
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
+    *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
     Ok(())
 }
 
@@ -2676,9 +2775,13 @@ fn open_notebook_from_ui(
     notebook_id: &str,
 ) -> Result<(), String> {
     crate::launch_clock::mark("notebook_open_start");
+    *x.read_only_hint_shown = false;
+    // A mirror notebook is never re-entered from memory: a rebuild may have replaced its pages
+    // while Home was showing.
     if ctrl.store().is_bound()
         && notebook_id == x.library.active_notebook_id()
         && notebook_id == x.manifest.notebook_id
+        && !*x.session_read_only
     {
         let title = x.library.title(notebook_id)?.to_string();
         ctrl.transport_mut().set_chrome_title(&title);
@@ -2738,6 +2841,7 @@ fn open_notebook_from_ui(
     )?;
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
+    *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
     crate::launch_clock::mark("notebook_bind_end");
     x.ui.enter_notebook();
     println!(
@@ -3835,6 +3939,14 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             Err(e) => eprintln!("nbk_import_recovery_failed detail={e}"),
         }
     }
+    // Amazon mirror: a crash mid-rebuild leaves a `Rebuilding` entry. Remove its partial
+    // notebook before any UI can open it; the next scan rebuilds it. Never aborts launch.
+    if crate::mirror::MirrorLedger::path_for(library.root()).exists() {
+        match crate::mirror::recover_interrupted(&mut library, &crate::nbk_import::GlobalSync) {
+            Ok(n) => println!("mirror_recovered count={n}"),
+            Err(e) => eprintln!("mirror_recovery_failed detail={e}"),
+        }
+    }
 
     if library_open.migrated_legacy {
         println!("legacy_library_migration=true");
@@ -3874,6 +3986,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut ui = UiState::launch_home(active_notebook_index(&library), launch_cards.len());
     let prefs_path = prefs::preferences_path(cfg.sync_dir.as_deref(), cfg.device_dir.as_deref());
     ui.side_button = prefs::load_side_button(&prefs_path);
+    let mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
+    println!("mirror_amazon_enabled={mirror_enabled}");
     if product_sync {
         ui.enable_sync();
     }
@@ -3938,6 +4052,12 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut stylus_mode_disarm_failed = false;
     let mut sleep_guard: Option<crate::sleep_ui::SleepGuard> = None;
     let mut import_run: Option<ImportRun> = None;
+    let mut mirror_run: Option<crate::mirror::MirrorRun> = None;
+    let mut mirror_clock = crate::mirror::MirrorClock::default();
+    // Launch is unbound (Home); every bind path sets this from the notebook's marker.
+    let mut session_read_only = false;
+    let mut read_only_hint_shown = false;
+    let mut read_only_hint_due = false;
     let mut input_lag = crate::input_lag::InputLag::default();
     let mut last_stylus_us = 0u64;
     let mut sync_capture_max_us = 0u64;
@@ -4055,6 +4175,9 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     hosted: cfg.display_events_stdin,
                     stop: &stop,
                     import_run: &mut import_run,
+                    mirror_run: &mut mirror_run,
+                    session_read_only: &mut session_read_only,
+                    read_only_hint_shown: &mut read_only_hint_shown,
                     prefs_path: &prefs_path,
                     sync_dir: cfg.sync_dir.as_deref(),
                     lasso: &mut lasso,
@@ -4203,6 +4326,97 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         {
             if let Err(e) = import_step(&mut ui_exec!(), &mut ctrl) {
                 eprintln!("error: nbk import present: {e}");
+                let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                shutdown_safe = safe;
+                stylus_mode_disarm_failed = disarm_fail;
+                break 1;
+            }
+            continue;
+        }
+
+        // A pen touched a mirror (read-only) page: the contact was discarded on the pen path;
+        // show the one-line hint here, once per open, at the safe point.
+        if structure_eligible && pending_ui.is_none() && read_only_hint_due {
+            read_only_hint_due = false;
+            if ui.view == AppView::Notebook && !ui.modal_open() {
+                ui.show_error(READ_ONLY_HINT);
+                ui.note_modal_transition(false, ms_since_start(Instant::now()));
+                println!("mirror_read_only_hint notebook={}", manifest.notebook_id);
+                if let Err(e) =
+                    execute_ui_command(UiCommand::Redraw(Redraw::Full), &mut ui_exec!(), &mut ctrl)
+                {
+                    eprintln!("error: read-only hint present: {e}");
+                    let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                    shutdown_safe = safe;
+                    stylus_mode_disarm_failed = disarm_fail;
+                    break 1;
+                }
+                continue;
+            }
+        }
+
+        // Amazon mirror scan: stat-only, at launch, after an upload batch, or after 15 idle
+        // minutes. Needs linked sync (every mirror edit is captured) and no import run.
+        let sync_linked = crate::sync_outbound::with_global(|_| ()).is_some();
+        if structure_eligible
+            && pending_ui.is_none()
+            && !ui.modal_open()
+            && mirror_run.is_none()
+            && import_run.is_none()
+            && mirror_enabled
+            && sync_linked
+        {
+            let batches = crate::sync_outbound::with_global(|s| s.stats().batches).unwrap_or(0);
+            let now = Instant::now();
+            if crate::mirror::scan_due(&mirror_clock, now, batches) {
+                mirror_clock.last_scan = Some(now);
+                mirror_clock.last_batches = batches;
+                match crate::mirror::MirrorLedger::open(library.root()) {
+                    Ok(mut ledger) => match crate::mirror::scan(
+                        &crate::nbk_import::ImportSources::kindle(),
+                        &ledger,
+                    ) {
+                        Ok(r) => {
+                            println!(
+                                "mirror_scan actions={} current={} unsupported={}",
+                                r.actions.len(),
+                                r.current,
+                                r.unsupported.len()
+                            );
+                            if !r.actions.is_empty() {
+                                mirror_run = Some(crate::mirror::MirrorRun {
+                                    queue: r.actions.into(),
+                                    done: 0,
+                                    failed: vec![],
+                                });
+                            }
+                            if let Err(e) = ledger.note_scan(None) {
+                                eprintln!("mirror_scan_note_failed detail={e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("mirror_scan_failed detail={e}");
+                            if let Err(w) = ledger.note_scan(Some(e)) {
+                                eprintln!("mirror_scan_note_failed detail={w}");
+                            }
+                        }
+                    },
+                    Err(e) => eprintln!("mirror_scan_failed detail={e}"),
+                }
+                continue;
+            }
+        }
+
+        // Amazon mirror rebuild: one action per pass, Home/Tools only (never with a page
+        // open), never during an import, and only while sync is linked.
+        if structure_eligible
+            && pending_ui.is_none()
+            && !ui.modal_open()
+            && mirror_run.is_some()
+            && crate::mirror::step_allowed(ui.view, import_run.is_some(), sync_linked)
+        {
+            if let Err(e) = mirror_step(&mut ui_exec!(), &mut ctrl) {
+                eprintln!("error: mirror present: {e}");
                 let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
                 shutdown_safe = safe;
                 stylus_mode_disarm_failed = disarm_fail;
@@ -4813,6 +5027,15 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                         // Never interrupt an active pen stroke / armed wet path.
                         continue;
                     }
+                    if session_read_only {
+                        // Mirror notebook: consume the contact until Up; nothing is erased.
+                        let _ = nav.on_down(NavDownAction::IgnoreNoInk);
+                        if !read_only_hint_shown {
+                            read_only_hint_shown = true;
+                            read_only_hint_due = true;
+                        }
+                        continue;
+                    }
                     let page = device_to_page(&cal, ev.device.x, ev.device.y);
                     let strokes = ctrl.session.committed_strokes().to_vec();
                     let roots = ctrl.session.root_of_map().clone();
@@ -4946,6 +5169,15 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                 continue;
                             }
                         }
+                    }
+                    if session_read_only {
+                        // Mirror notebook: consume the contact until Up (no stroke, no ink).
+                        let _ = nav.on_down(NavDownAction::IgnoreNoInk);
+                        if !read_only_hint_shown {
+                            read_only_hint_shown = true;
+                            read_only_hint_due = true;
+                        }
+                        continue;
                     }
                     match ctrl.on_pen_down(page, ev.pressure) {
                         Ok(id) => {

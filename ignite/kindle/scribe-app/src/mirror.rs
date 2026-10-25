@@ -240,7 +240,18 @@ pub enum MirrorAction {
 }
 
 impl MirrorAction {
-    fn origin_id(&self) -> &str {
+    /// Variant name for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Rebuild { .. } => "rebuild",
+            Self::Rename { .. } => "rename",
+            Self::Restore { .. } => "restore",
+            Self::Remove { .. } => "remove",
+        }
+    }
+
+    pub fn origin_id(&self) -> &str {
         match self {
             Self::Create { source, .. }
             | Self::Rebuild { source, .. }
