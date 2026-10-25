@@ -357,6 +357,7 @@ fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
     let mut clock = MirrorClock {
         last_scan: Some(Instant::now()),
         last_batches: 3,
+        recovery_done: false,
     };
     assert!(apply_mirror_toggle(false, &mut run, &mut clock));
     assert!(run.is_none());
@@ -1482,11 +1483,13 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
     let launch = MirrorClock {
         last_scan: None,
         last_batches: 0,
+        recovery_done: false,
     };
     assert!(scan_due(&launch, t0, 0));
     let after = MirrorClock {
         last_scan: Some(t0),
         last_batches: 3,
+        recovery_done: false,
     };
     assert!(!scan_due(&after, t0, 3));
     assert!(!scan_due(&after, t0 + Duration::from_secs(60), 3));
@@ -1497,6 +1500,40 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
         3
     ));
     assert!(scan_due(&after, t0 + IDLE_RESCAN, 3));
+}
+
+#[test]
+fn recovery_waits_for_sync_and_runs_once_per_process() {
+    let mut clock = MirrorClock::default();
+    // Launch with sync not installed (or faulted): a local delete would leave the partial on
+    // the server, so recovery waits.
+    assert!(!recovery_due(&clock, false));
+    assert!(recovery_due(&clock, true));
+    clock.recovery_done = true;
+    assert!(!recovery_due(&clock, true));
+    assert!(!recovery_due(&clock, false));
+    // The toggle does not reset it: recovery is independent of the preference.
+    let mut run = None;
+    apply_mirror_toggle(true, &mut run, &mut clock);
+    assert!(clock.recovery_done);
+    assert!(!recovery_due(&clock, true));
+}
+
+#[test]
+fn a_rebuilding_entry_rebuilds_in_place_before_recovery_never_a_second_mirror() {
+    // Until recovery runs, a scan sees the Rebuilding entry and schedules a Rebuild, which
+    // reuses the partial notebook: at no point do two mirrors of one origin exist.
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Rebuilding))
+        .unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source, .. }] if source.origin_id == ID_A
+    ));
 }
 
 #[test]

@@ -4106,14 +4106,9 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             Err(e) => eprintln!("nbk_import_recovery_failed detail={e}"),
         }
     }
-    // Amazon mirror: a crash mid-rebuild leaves a `Rebuilding` entry. Remove its partial
-    // notebook before any UI can open it; the next scan rebuilds it. Never aborts launch.
-    if crate::mirror::MirrorLedger::path_for(library.root()).exists() {
-        match crate::mirror::recover_interrupted(&mut library, &crate::nbk_import::GlobalSync) {
-            Ok(n) => println!("mirror_recovered count={n}"),
-            Err(e) => eprintln!("mirror_recovery_failed detail={e}"),
-        }
-    }
+    // Amazon mirror: a crash mid-rebuild leaves a `Rebuilding` entry. Its recovery is deferred
+    // to the first structural safe point with sync linked (see `mirror::recovery_due`), so the
+    // partial's delete is a synced one; until then a scan rebuilds the partial in place.
 
     if library_open.migrated_legacy {
         println!("legacy_library_migration=true");
@@ -4532,8 +4527,30 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             continue;
         }
 
-        // Amazon mirror: scan and rebuild steps share one gate: Home/Tools only (never with a
-        // page open), no import run, sync linked, and the pen quiet (as inbound apply).
+        // Amazon mirror: crash recovery, scans and rebuild steps share one gate: Home/Tools
+        // only (never with a page open), no import run, sync linked, and the pen quiet (as
+        // inbound apply). Recovery runs first, once per process, whatever the toggle says.
+        if structure_eligible
+            && pending_ui.is_none()
+            && !ui.modal_open()
+            && matches!(ui.view, AppView::Home | AppView::Tools)
+            && crate::mirror::recovery_due(
+                &mirror_clock,
+                crate::sync_outbound::with_global(|_| ()).is_some(),
+            )
+        {
+            mirror_clock.recovery_done = true;
+            if crate::mirror::MirrorLedger::path_for(library.root()).exists() {
+                match crate::mirror::recover_interrupted(
+                    &mut library,
+                    &crate::nbk_import::GlobalSync,
+                ) {
+                    Ok(n) => println!("mirror_recovered count={n}"),
+                    Err(e) => eprintln!("mirror_recovery_failed detail={e}"),
+                }
+            }
+            continue;
+        }
         if structure_eligible
             && pending_ui.is_none()
             && !ui.modal_open()

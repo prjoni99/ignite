@@ -990,9 +990,13 @@ fn remove(
     Ok(MirrorOutcome::Done)
 }
 
-/// Startup: every `Rebuilding` entry's notebook is removed through the synced delete path and
-/// the entry dropped (so the next scan recreates it). Runs before any UI, next to the
-/// `nbk_import` recovery. Returns how many entries were recovered.
+/// Crash recovery: every `Rebuilding` entry's notebook is removed through the synced delete
+/// path and the entry dropped (so the next scan recreates it). Runs once per process at the
+/// first structural safe point where sync is linked ([`recovery_due`]), never at launch: with
+/// sync not installed `GlobalSync::delete_notebook` falls back to a local delete and the
+/// server would keep the partial. Until it runs, a scan still classifies the entry as
+/// `Rebuild`, which rebuilds the partial in place (never a second mirror). Returns how many
+/// entries were recovered.
 pub(crate) fn recover_interrupted(
     library: &mut LibraryRepository,
     sync: &dyn MirrorSync,
@@ -1041,6 +1045,15 @@ pub struct MirrorRun {
 pub struct MirrorClock {
     pub last_scan: Option<Instant>,
     pub last_batches: u64,
+    /// [`recover_interrupted`] has run (or been attempted) this process.
+    pub recovery_done: bool,
+}
+
+/// Should crash recovery run now? Once per process, and only once sync is linked, so the
+/// partial's delete reaches the server. Recovery precedes the first scan and step: both
+/// share this gate's safe point and run only while `sync_linked` too.
+pub fn recovery_due(clock: &MirrorClock, sync_linked: bool) -> bool {
+    !clock.recovery_done && sync_linked
 }
 
 /// Apply the Preferences toggle to the scheduler. Off drops any in-progress run (each step is
