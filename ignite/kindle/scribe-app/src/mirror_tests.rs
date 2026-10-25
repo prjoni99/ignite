@@ -461,3 +461,35 @@ fn no_sync_rename_notebook_retitles_it() {
     s.reopen();
     assert_eq!(s.lib.title("notebook-7").unwrap(), "New");
 }
+
+#[test]
+fn delete_page_refuses_the_only_page_and_propagates_the_refusal() {
+    let mut s = Scribe::new();
+    let g = geo();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut t = crate::nbk_import::ImportTarget {
+        library: &mut s.lib,
+        profile: &s.profile,
+        geo: &g,
+        paper: &s.paper,
+        cancel: &cancel,
+    };
+    crate::nbk_import::build(
+        &mut t,
+        "notebook-7",
+        "One",
+        &[vec![]],
+        ("m.json", b"{}"),
+        &NoSync,
+    )
+    .unwrap();
+    let dir = s.lib.notebook_dir("notebook-7");
+    let mut m = crate::library::read_notebook_manifest_read_only(&dir).unwrap();
+    let only = m.page_ids[0].clone();
+    let e = NoSync
+        .delete_page(&dir, &mut m, "notebook-7", &only)
+        .unwrap_err();
+    assert!(e.starts_with("REFUSE PAGE DELETE"), "{e}");
+    let re = crate::library::read_notebook_manifest_read_only(&dir).unwrap();
+    assert_eq!(re.page_ids, vec![only]);
+}

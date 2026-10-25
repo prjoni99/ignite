@@ -434,9 +434,18 @@ impl MirrorSync for GlobalSync {
             Some(Some(t)) => Some(t),
         };
         let r = delete_page_durable(nb_dir, manifest, page_id, &DeletePageHooks::default());
+        // Unlike rename: only a refusal (nothing durable happened) aborts. Any other failure
+        // leaves the ticket unresolved for startup recovery, exactly as the runtime does.
         if let Some(t) = ticket {
-            let ok = r.is_ok();
-            crate::sync_outbound::with_global(|s| if ok { s.commit(t) } else { s.abort(t) });
+            match &r {
+                Ok(_) => {
+                    crate::sync_outbound::with_global(|s| s.commit(t));
+                }
+                Err(e) if e.starts_with("REFUSE PAGE DELETE") => {
+                    crate::sync_outbound::with_global(|s| s.abort(t));
+                }
+                Err(_) => {}
+            }
         }
         r.map(|_| ())
     }
@@ -459,6 +468,7 @@ impl MirrorSync for GlobalSync {
         };
         let r =
             rename_notebook_durable(library, notebook_id, title, &RenameNotebookHooks::default());
+        // Like the runtime: abort on any error or an unchanged title (no delete-style recovery).
         if let Some(t) = ticket {
             let changed = r.as_ref().is_ok_and(|c| c.changed);
             crate::sync_outbound::with_global(|s| if changed { s.commit(t) } else { s.abort(t) });
@@ -503,6 +513,8 @@ pub(crate) fn ensure_folder(
         Which::Amazon => (Some(id.clone()), ledger.data.removed_folder.clone()),
         Which::Removed => (ledger.data.amazon_folder.clone(), Some(id.clone())),
     };
+    // Accepted edge: if this write fails, the folder was already created and captured, so a
+    // synced (harmless) folder is left that the next call will not reuse.
     ledger.set_folders(amazon, removed)?;
     Ok(id)
 }
