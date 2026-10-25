@@ -26,6 +26,17 @@ pub enum SideButtonAction {
     CreateLink,
 }
 
+/// Where Ignite goes when it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAtLaunch {
+    /// The library (shipped default).
+    #[default]
+    Home,
+    /// Today's daily page.
+    Today,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct PreferencesFile {
     v: u32,
@@ -36,6 +47,9 @@ struct PreferencesFile {
     /// Last template used when creating a notebook or inserting a page. Defaults to blank.
     #[serde(default)]
     template: TemplateId,
+    /// Where Ignite goes when it starts. Defaults to Home.
+    #[serde(default)]
+    open_at_launch: OpenAtLaunch,
 }
 
 fn default_true() -> bool {
@@ -49,6 +63,7 @@ impl Default for PreferencesFile {
             side_button: SideButtonAction::NavigationUndo,
             mirror_amazon: true,
             template: TemplateId::default(),
+            open_at_launch: OpenAtLaunch::Home,
         }
     }
 }
@@ -121,6 +136,20 @@ pub fn load_template(path: &Path) -> TemplateId {
 pub fn save_template(path: &Path, id: &TemplateId) -> Result<(), String> {
     let file = PreferencesFile {
         template: id.clone(),
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+/// Load the launch destination. Missing/unreadable/malformed → Home.
+pub fn load_open_at_launch(path: &Path) -> OpenAtLaunch {
+    load(path).open_at_launch
+}
+
+/// Persist the launch destination, keeping the other preferences.
+pub fn save_open_at_launch(path: &Path, open_at_launch: OpenAtLaunch) -> Result<(), String> {
+    let file = PreferencesFile {
+        open_at_launch,
         ..load(path)
     };
     write(path, &file)
@@ -261,6 +290,35 @@ mod tests {
         save_mirror_enabled(&p, true).unwrap();
         assert!(load_mirror_enabled(&p));
         assert_eq!(load_side_button(&p), SideButtonAction::NavigationUndo);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn preferences_open_at_launch_round_trips() {
+        let p = temp_path("launch");
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Home);
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"create_link"}"#).open_at_launch,
+            OpenAtLaunch::Home
+        );
+        save_side_button(&p, SideButtonAction::CreateLink).unwrap();
+        save_mirror_enabled(&p, false).unwrap();
+        save_open_at_launch(&p, OpenAtLaunch::Today).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Today);
+        assert_eq!(load_side_button(&p), SideButtonAction::CreateLink);
+        assert!(!load_mirror_enabled(&p));
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains(r#""open_at_launch": "today""#));
+        save_side_button(&p, SideButtonAction::NavigationUndo).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Today);
+        save_open_at_launch(&p, OpenAtLaunch::Home).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Home);
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"create_link","open_at_launch":"never"}"#)
+                .open_at_launch,
+            OpenAtLaunch::Home
+        );
         let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 

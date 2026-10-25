@@ -21,7 +21,7 @@ use crate::link_picker::LinkPickerState;
 use crate::modal::{
     dialog_spec, ButtonId, DialogLayout, Modal, PickerPurpose, TitlePurpose, PICKER_PAGE,
 };
-use crate::prefs::SideButtonAction;
+use crate::prefs::{OpenAtLaunch, SideButtonAction};
 use crate::server_link::LinkView;
 use crate::settings_ui::{PreferencesHit, PreferencesLayout, SettingsChromeHit};
 use crate::sync_ui::{SyncHit, SyncLayout};
@@ -83,6 +83,10 @@ pub enum UiCommand {
     OpenPreferences,
     /// Persist and apply a side-button preference.
     SetSideButton(crate::prefs::SideButtonAction),
+    /// Persist where Ignite goes when it starts.
+    SetOpenAtLaunch(OpenAtLaunch),
+    /// Home TODAY: open (creating as needed) today's daily page.
+    OpenToday,
     /// Tools: scan the Kindle's notebooks (read-only).
     ToolsScan,
     /// Tools: import every eligible Kindle notebook (one-way copy).
@@ -209,6 +213,8 @@ pub struct UiState {
     pub mirror_enabled: bool,
     /// Last used page template (`preferences.json`): the template picker preselects it.
     pub template: TemplateId,
+    /// Where Ignite goes when it starts (`preferences.json`).
+    pub open_at_launch: OpenAtLaunch,
     /// `<library>/notebooks`, set by the runtime: a card menu checks the mirror marker here.
     pub notebooks_root: Option<std::path::PathBuf>,
     /// Link-target picker (only while `AppView::LinkTargetPicker`).
@@ -236,6 +242,7 @@ impl UiState {
             side_button: SideButtonAction::NavigationUndo,
             mirror_enabled: false,
             template: TemplateId::default(),
+            open_at_launch: OpenAtLaunch::Home,
             notebooks_root: None,
             link_picker: None,
             folders: Vec::new(),
@@ -553,6 +560,7 @@ impl UiState {
             Some(HomeHit::Exit) => Some(UiCommand::ExitApp),
             Some(HomeHit::Sync) => Some(UiCommand::OpenSync),
             Some(HomeHit::Tools) => Some(UiCommand::OpenTools),
+            Some(HomeHit::Today) => Some(UiCommand::OpenToday),
             _ => None,
         };
         if let Some(cmd) = cmd {
@@ -564,7 +572,8 @@ impl UiState {
             | Some(HomeHit::SearchPlaceholder)
             | Some(HomeHit::Exit)
             | Some(HomeHit::Sync)
-            | Some(HomeHit::Tools) => UiCommand::None,
+            | Some(HomeHit::Tools)
+            | Some(HomeHit::Today) => UiCommand::None,
             Some(HomeHit::Back) => {
                 // Back to the main list, showing the folder just left.
                 self.home_folder = None;
@@ -668,6 +677,8 @@ impl UiState {
                 UiCommand::SetSideButton(SideButtonAction::CreateLink)
             }
             Some(PreferencesHit::MirrorToggle) => UiCommand::SetMirrorEnabled(!self.mirror_enabled),
+            Some(PreferencesHit::LaunchHome) => UiCommand::SetOpenAtLaunch(OpenAtLaunch::Home),
+            Some(PreferencesHit::LaunchToday) => UiCommand::SetOpenAtLaunch(OpenAtLaunch::Today),
         }
     }
 
@@ -1356,6 +1367,34 @@ mod tests {
             y: r.y + r.h / 2,
         };
         ui.on_tap(g, p, &[], "Notebook 3", None)
+    }
+
+    #[test]
+    fn today_tile_and_open_at_launch_rows_resolve_to_commands() {
+        use crate::prefs::OpenAtLaunch;
+        let g = crate::ui_gfx::panel_geo();
+        let center = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let mut ui = UiState::launch_home(0, 0);
+        assert_eq!(ui.open_at_launch, OpenAtLaunch::Home);
+        let today = HomeLayout::new(&g, &ui.home, 0).today_button;
+        assert_eq!(
+            ui.on_tap(&g, center(today), &[], "Notebook 1", None),
+            UiCommand::OpenToday
+        );
+        assert!(!mutates_open_notebook(&UiCommand::OpenToday));
+        ui.enter_preferences();
+        let l = PreferencesLayout::new(&g);
+        assert_eq!(
+            ui.on_tap(&g, center(l.launch_today), &[], "Notebook 1", None),
+            UiCommand::SetOpenAtLaunch(OpenAtLaunch::Today)
+        );
+        assert_eq!(
+            ui.on_tap(&g, center(l.launch_home), &[], "Notebook 1", None),
+            UiCommand::SetOpenAtLaunch(OpenAtLaunch::Home)
+        );
     }
 
     #[test]

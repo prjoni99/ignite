@@ -77,7 +77,7 @@ use crate::orch::{
     dirty_to_send_rect, input_kernel_for_du_timing, require_eviocgrab, CtrlError, DuSendResult,
     InkTransport, StrokeController, UndoResult, WaitResult,
 };
-use crate::prefs::{self, SideButtonAction};
+use crate::prefs::{self, OpenAtLaunch, SideButtonAction};
 use crate::pressure::PressureStrokeSummary;
 use crate::profile::RenderProfile;
 use crate::store::{page_dir, resolve_data_dir, PageStore, RuntimeStore, DEFAULT_PAGE_ID};
@@ -321,6 +321,7 @@ impl KindleTransport {
         &mut self,
         action: SideButtonAction,
         mirror_enabled: bool,
+        open_at_launch: OpenAtLaunch,
         dialog: Option<&DialogSpec>,
     ) -> Result<(), String> {
         self.chrome_on_panel = false;
@@ -329,6 +330,7 @@ impl KindleTransport {
             &self.geometry,
             action,
             mirror_enabled,
+            open_at_launch,
         )?;
         if let Some(spec) = dialog {
             render_dialog(self.fb.as_slice_mut(), &self.geometry, spec)?;
@@ -2569,6 +2571,7 @@ fn present_ui(
             ctrl.transport_mut().render_preferences(
                 x.ui.side_button,
                 x.ui.mirror_enabled,
+                x.ui.open_at_launch,
                 dialog.as_ref(),
             )
         }
@@ -3153,6 +3156,210 @@ fn remember_template(x: &mut UiExec<'_>, template: TemplateId) {
     x.ui.template = template;
 }
 
+/// Result of [`open_today`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TodayOutcome {
+    Opened {
+        notebook_id: String,
+        page_id: String,
+        created: bool,
+    },
+    /// The device clock looks unset: nothing was created.
+    ClockUnset,
+}
+
+/// Resolve today's daily page, creating the `Daily` folder, the month notebook or the day page
+/// as needed (each durable write captured for sync; new pages stamped with the date). Showing
+/// it is [`show_daily_page`]'s job, so `Err` here is only a recoverable resolution failure.
+fn open_today(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<TodayOutcome, String> {
+    let Some(now) = crate::clock::now_local() else {
+        return Ok(TodayOutcome::ClockUnset);
+    };
+    let mut ledger = crate::daily::DailyLedger::open(x.library.root())?;
+    // The bound notebook's manifest lives in memory: a day page for it is inserted there so
+    // memory == disk (the runtime's own insert path), any other notebook's on disk.
+    let bound =
+        (ctrl.store().is_bound() && !*x.session_read_only).then(|| x.manifest.notebook_id.clone());
+    let geo = x.geo;
+    let profile: &RenderProfile = x.notebook_profile;
+    let bound_manifest: &mut PersistedNotebookManifestV1 = x.manifest;
+    let mut create = |what: crate::daily::CreateWhat,
+                      library: &mut LibraryRepository,
+                      folders: &mut FolderStore|
+     -> Result<String, String> {
+        use crate::daily::CreateWhat;
+        match what {
+            CreateWhat::Folder => {
+                let live = library.manifest().notebook_ids.clone();
+                let id = folders.create(crate::daily::DAILY_FOLDER_TITLE, &live)?;
+                capture_folder_change(folders, FolderCapture::Created(id.clone()));
+                println!("folder_created folder={id} source=daily");
+                Ok(id)
+            }
+            CreateWhat::Month { title, folder_id } => {
+                let daily = TemplateId::Builtin { id: "daily".into() };
+                let paper = templates::bitmap(library.root(), &daily, &geo)?;
+                let commit = create_notebook_durable(
+                    library,
+                    profile,
+                    &geo,
+                    &paper,
+                    Some(&title),
+                    &CreateNotebookHooks::default(),
+                )?;
+                sync_notebook_created(library, &commit.notebook_id, &commit.title);
+                println!(
+                    "notebook_created notebook={} title={:?} manifest_persist_us={} source=daily folder={folder_id}",
+                    commit.notebook_id, commit.title, commit.manifest_persist_us
+                );
+                // The notebook exists either way; a filing failure only leaves it on the main
+                // list.
+                let live = library.manifest().notebook_ids.clone();
+                match folders.set_folder(&commit.notebook_id, Some(&folder_id), &live) {
+                    Ok(()) => capture_folder_change(
+                        folders,
+                        FolderCapture::Filed {
+                            notebook: commit.notebook_id.clone(),
+                            folder: Some(folder_id),
+                        },
+                    ),
+                    Err(e) => eprintln!(
+                        "folder_membership_changed_failed notebook={} detail={e}",
+                        commit.notebook_id
+                    ),
+                }
+                Ok(commit.notebook_id)
+            }
+            CreateWhat::Day {
+                notebook_id,
+                after_page,
+            } => {
+                let nb_dir = library.notebook_dir(&notebook_id);
+                let mut disk;
+                let manifest: &mut PersistedNotebookManifestV1 =
+                    if bound.as_deref() == Some(notebook_id.as_str()) {
+                        &mut *bound_manifest
+                    } else {
+                        disk = crate::library::read_notebook_manifest_read_only(&nb_dir)?;
+                        &mut disk
+                    };
+                let commit = insert_page_after_durable(
+                    &nb_dir,
+                    manifest,
+                    &after_page,
+                    &InsertPageHooks::default(),
+                )?;
+                library.set_cached_page_count(&notebook_id, manifest.page_ids.len());
+                crate::sync_outbound::with_global(|s| {
+                    s.page_created(
+                        &nb_dir,
+                        &notebook_id,
+                        &commit.inserted_page_id,
+                        Some(&after_page),
+                    )
+                });
+                println!(
+                    "page_inserted after={after_page} new={} index={} manifest_persist_us={} page_count={} source=daily",
+                    commit.inserted_page_id,
+                    commit.insert_index,
+                    commit.manifest_persist_us,
+                    manifest.page_ids.len()
+                );
+                Ok(commit.inserted_page_id)
+            }
+        }
+    };
+    let (notebook_id, page_id, created) =
+        crate::daily::resolve_today(&mut ledger, x.library, x.folders, &now, &mut create)?;
+    Ok(TodayOutcome::Opened {
+        notebook_id,
+        page_id,
+        created,
+    })
+}
+
+/// TODAY / open-at-launch Today. A clock that looks unset shows the notice; a resolution
+/// failure is logged (and shown, except at launch) and leaves the view as it was. `Err` is
+/// fatal (a failure binding the resolved page).
+fn run_open_today(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    at_launch: bool,
+) -> Result<(), String> {
+    let source = if at_launch { "launch" } else { "ui" };
+    match open_today(x, ctrl) {
+        Ok(TodayOutcome::Opened {
+            notebook_id,
+            page_id,
+            created,
+        }) => {
+            println!(
+                "daily_open notebook={notebook_id} page={page_id} created={created} source={source}"
+            );
+            show_daily_page(x, ctrl, &notebook_id, &page_id)
+        }
+        Ok(TodayOutcome::ClockUnset) => {
+            println!("daily_open_refused reason=clock_unset source={source}");
+            x.ui.show_modal(Modal::clock_unset_notice());
+            present_ui(x, ctrl, None)
+        }
+        Err(e) => {
+            eprintln!("daily_open_failed source={source} detail={e}");
+            if !at_launch {
+                x.ui.show_error("Today's page couldn't be opened.");
+            }
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+/// Show `page_id` of `notebook_id`: a notebook that is not the bound one opens straight on the
+/// page (its remembered selection is set first, so one paint); the bound one switches page.
+fn show_daily_page(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    notebook_id: &str,
+    page_id: &str,
+) -> Result<(), String> {
+    x.ui.modal = None;
+    let bound_here = ctrl.store().is_bound()
+        && !*x.session_read_only
+        && notebook_id == x.manifest.notebook_id
+        && notebook_id == x.library.active_notebook_id();
+    if bound_here {
+        let title = x.library.title(notebook_id)?.to_string();
+        ctrl.transport_mut().set_chrome_title(&title);
+        x.ui.enter_notebook();
+    } else {
+        let dir = x.library.notebook_dir(notebook_id);
+        match crate::library::read_notebook_manifest_read_only(&dir)
+            .and_then(|mut m| persist_active_page(&dir, &mut m, page_id))
+        {
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: daily_select_page_failed page={page_id} detail={e}"),
+        }
+        open_notebook_from_ui(x, ctrl, notebook_id)?;
+        // The open failed (its error is showing) or already landed on the page.
+        if x.ui.view != AppView::Notebook
+            || x.manifest.notebook_id != notebook_id
+            || ctrl.session.page_id() == page_id
+        {
+            return Ok(());
+        }
+    }
+    if ctrl.session.page_id() != page_id {
+        bind_existing_page(
+            x.notebook_dir,
+            x.manifest,
+            ctrl,
+            x.notebook_profile,
+            x.current_bg,
+            page_id,
+        )?;
+    }
+    present_ui(x, ctrl, None)
+}
+
 /// UI notebook create: the first page's background is `paper`; filed in `folder_id` when set;
 /// `template` is remembered as the last used once the notebook exists.
 fn create_notebook_from_ui(
@@ -3307,6 +3514,20 @@ fn execute_ui_command(
             }
             present_ui(x, ctrl, None)
         }
+        UiCommand::SetOpenAtLaunch(open_at_launch) => {
+            match prefs::save_open_at_launch(x.prefs_path, open_at_launch) {
+                Ok(()) => {
+                    x.ui.open_at_launch = open_at_launch;
+                    println!("open_at_launch={open_at_launch:?}");
+                }
+                Err(e) => {
+                    eprintln!("preferences_save_failed detail={e}");
+                    x.ui.show_error("The preference couldn't be saved.");
+                }
+            }
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::OpenToday => run_open_today(x, ctrl, false),
         UiCommand::BeginCreateLink { x: px, y: py } => begin_create_link(x, ctrl, px, py),
         UiCommand::LinkPickerCancel => leave_link_picker(x, ctrl),
         UiCommand::LinkPickerOpenNotebook(id) => open_picker_notebook(x, ctrl, &id),
@@ -4040,6 +4261,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     ui.side_button = prefs::load_side_button(&prefs_path);
     ui.mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
     ui.template = prefs::load_template(&prefs_path);
+    ui.open_at_launch = prefs::load_open_at_launch(&prefs_path);
     println!("mirror_amazon_enabled={}", ui.mirror_enabled);
     if product_sync {
         ui.enable_sync();
@@ -4116,6 +4338,9 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut sync_capture_max_us = 0u64;
     let mut inbound_apply_count = 0u64;
     let mut inbound_apply_max_us = 0u64;
+    // Open-at-launch Today: once, at the first structural safe point after Home is painted.
+    let mut today_at_launch = ui.open_at_launch == OpenAtLaunch::Today;
+    println!("open_at_launch={:?}", ui.open_at_launch);
     let code = loop {
         crate::launch_diag::live().maybe_emit_stats();
         if stop.load(Ordering::SeqCst) {
@@ -4271,6 +4496,20 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     stylus_mode_disarm_failed = disarm_fail;
                     break 1;
                 }
+            }
+            continue;
+        }
+
+        if structure_eligible && today_at_launch {
+            today_at_launch = false;
+            let result = run_open_today(&mut ui_exec!(), &mut ctrl, true);
+            crate::launch_clock::mark("today_open_end");
+            if let Err(e) = result {
+                eprintln!("error: open today at launch: {e}");
+                let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                shutdown_safe = safe;
+                stylus_mode_disarm_failed = disarm_fail;
+                break 1;
             }
             continue;
         }

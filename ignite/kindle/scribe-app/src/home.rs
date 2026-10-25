@@ -21,7 +21,7 @@ pub use crate::folders::FolderInfo;
 pub const ROWS_PER_PAGE: usize = 6;
 
 const MARGIN: u32 = 60;
-/// Compact top bar: [exit] [search placeholder] [sync] [+ new] [tools]. Every control keeps a
+/// Compact top bar: [exit] [search placeholder] [today] [sync] [+ new] [tools]. Every control keeps a
 /// >= 130 px (about 11 mm) pen/finger target.
 const BAR_Y: u32 = 36;
 const BAR_H: u32 = 130;
@@ -32,6 +32,8 @@ const NEW_W: u32 = 280;
 /// D1: the Sync entry point (product mode only), left of "+ NEW".
 const SYNC_W: u32 = 230;
 const TOOLS_W: u32 = BAR_H;
+/// Today's daily page, left of Sync (or of "+ NEW" without sync).
+const TODAY_W: u32 = NEW_W;
 const DIVIDER_Y: u32 = 196;
 const CARDS_TOP: u32 = 232;
 const CARD_GAP: u32 = 24;
@@ -267,6 +269,8 @@ pub enum HomeHit {
     Sync,
     /// Tools screen (Import Kindle notebooks, ...).
     Tools,
+    /// Open (creating as needed) today's daily page.
+    Today,
     /// Search placeholder: consumed, does nothing (search is not implemented yet).
     SearchPlaceholder,
 }
@@ -283,6 +287,8 @@ pub struct HomeLayout {
     /// D1: hit/drawn only when `HomeState::sync`.
     pub sync_button: Rect,
     pub tools_button: Rect,
+    /// Today's daily page, left of `sync_button` (of `new_button` without sync).
+    pub today_button: Rect,
     /// `(library index, card rect, menu rect)` for the visible viewport page.
     pub cards: Vec<(usize, Rect, Rect)>,
     /// `(folder index, tile rect, menu rect)` for the visible viewport page.
@@ -353,13 +359,15 @@ impl HomeLayout {
             SYNC_W,
             BAR_H,
         );
-        let search_left = exit_hit.right() + BAR_GAP;
-        let search_right = if state.sync {
+        let today_right = if state.sync {
             sync_button.x
         } else {
             new_button.x
         }
         .saturating_sub(BAR_GAP);
+        let today_button = Rect::new(today_right.saturating_sub(TODAY_W), BAR_Y, TODAY_W, BAR_H);
+        let search_left = exit_hit.right() + BAR_GAP;
+        let search_right = today_button.x.saturating_sub(BAR_GAP);
         let search = Rect::new(
             search_left,
             BAR_Y,
@@ -373,6 +381,7 @@ impl HomeLayout {
             new_button,
             sync_button,
             tools_button,
+            today_button,
             cards,
             folders,
             rows_len: all.len(),
@@ -406,6 +415,9 @@ impl HomeLayout {
         }
         if self.tools_button.contains(p.x, p.y) {
             return Some(HomeHit::Tools);
+        }
+        if self.today_button.contains(p.x, p.y) {
+            return Some(HomeHit::Today);
         }
         if self.search.contains(p.x, p.y) {
             return Some(HomeHit::SearchPlaceholder);
@@ -610,6 +622,8 @@ pub fn render_home_view(
         c.frame(layout.sync_button, 4, BLACK);
         c.text_centered(layout.sync_button.inset(8), 8, "SYNC", BLACK);
     }
+    c.frame(layout.today_button, 4, BLACK);
+    c.text_centered(layout.today_button.inset(8), 8, "TODAY", BLACK);
     c.fill(layout.new_button, BLACK);
     c.text_centered(layout.new_button.inset(8), 8, "+ NEW", WHITE);
     c.frame(layout.tools_button, 4, BLACK);
@@ -833,9 +847,49 @@ mod tests {
         let l2 = HomeLayout::new(&g, &st, 3);
         assert!(l2.search.w > l.search.w);
         assert_eq!(
-            l2.hit(c(l.sync_button), &st, 3),
+            l2.hit(c(l.search), &st, 3),
             Some(HomeHit::SearchPlaceholder)
         );
+    }
+
+    #[test]
+    fn home_layout_has_a_today_tile_that_does_not_overlap_new() {
+        let g = panel_geo();
+        let c = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let disjoint = |a: Rect, b: Rect| a.right() <= b.x || b.right() <= a.x;
+        for sync in [true, false] {
+            let mut st = HomeState::selecting(0, 3);
+            st.sync = sync;
+            let l = HomeLayout::new(&g, &st, 3);
+            let t = l.today_button;
+            assert_eq!((t.y, t.h, t.w), (l.new_button.y, l.new_button.h, TODAY_W));
+            assert_eq!(TODAY_W, NEW_W);
+            assert!(t.w >= 130 && t.h >= 130);
+            assert!(disjoint(t, l.new_button) && disjoint(t, l.search));
+            // [search] [today] [sync] [+ new]: Today sits left of Sync (or of + NEW).
+            assert!(l.search.right() <= t.x);
+            if sync {
+                assert!(disjoint(t, l.sync_button));
+                assert_eq!(t.right() + BAR_GAP, l.sync_button.x);
+            } else {
+                assert_eq!(t.right() + BAR_GAP, l.new_button.x);
+            }
+            assert!(l.search.w >= 130, "{:?}", l.search);
+            assert_eq!(l.hit(c(t), &st, 3), Some(HomeHit::Today));
+            assert_eq!(l.hit(c(l.new_button), &st, 3), Some(HomeHit::New));
+        }
+        // Painted with its label (non-white pixels inside the tile).
+        let mut st = HomeState::selecting(0, 0);
+        st.sync = true;
+        let mut fb = vec![0x55; g.smem_len as usize];
+        render_home_view(&mut fb, &g, &[], &[], None, &st).unwrap();
+        let t = HomeLayout::new(&g, &st, 0).today_button.inset(12);
+        let inked = (t.y..t.bottom())
+            .any(|y| (t.x..t.right()).any(|x| fb[(y * g.line_length + x) as usize] != WHITE));
+        assert!(inked, "TODAY label painted");
     }
 
     #[test]

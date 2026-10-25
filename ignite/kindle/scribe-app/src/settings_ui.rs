@@ -1,11 +1,11 @@
 //! Settings chrome: peer tabs `TOOLS` and `PREFERENCES` (Home → tools icon).
 //!
 //! Tools still owns Import Kindle notebooks. Preferences owns replica-local options
-//! (side-button action, Amazon mirror switch). Neither view is a writing surface.
+//! (side-button action, Amazon mirror switch, open at launch). Neither view is a writing surface.
 
 use kindle_platform::FbGeometry;
 
-use crate::prefs::SideButtonAction;
+use crate::prefs::{OpenAtLaunch, SideButtonAction};
 use crate::ui_gfx::{fit_text, text_width, wrap_text, Canvas, Rect, BLACK, GLYPH_H, GRAY, WHITE};
 
 const MARGIN: u32 = 60;
@@ -115,6 +115,10 @@ pub enum PreferencesHit {
     CreateLink,
     /// Amazon mirror on/off.
     MirrorToggle,
+    /// Open at launch: Home.
+    LaunchHome,
+    /// Open at launch: today's daily page.
+    LaunchToday,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +127,8 @@ pub struct PreferencesLayout {
     pub nav_undo: Rect,
     pub create_link: Rect,
     pub mirror_toggle: Rect,
+    pub launch_home: Rect,
+    pub launch_today: Rect,
 }
 
 const SECTION_Y: u32 = 260;
@@ -134,15 +140,27 @@ const CHOICE_GAP: u32 = 40;
 const MIRROR_SECTION_Y: u32 = CHOICE_Y + 2 * (CHOICE_H + CHOICE_GAP) + 80;
 const MIRROR_BODY_Y: u32 = MIRROR_SECTION_Y + 100;
 const MIRROR_ROW_Y: u32 = MIRROR_BODY_Y + 160;
+/// OPEN AT LAUNCH section below the mirror row (heading, blurb, [Home] [Today] side by side).
+const LAUNCH_SECTION_Y: u32 = MIRROR_ROW_Y + CHOICE_H + 80;
+const LAUNCH_BODY_Y: u32 = LAUNCH_SECTION_Y + 100;
+const LAUNCH_ROW_Y: u32 = LAUNCH_BODY_Y + 160;
 
 impl PreferencesLayout {
     pub fn new(geo: &FbGeometry) -> Self {
         let w = geo.xres.saturating_sub(2 * MARGIN);
+        let half = w.saturating_sub(CHOICE_GAP) / 2;
         Self {
             chrome: SettingsChrome::new(geo),
             nav_undo: Rect::new(MARGIN, CHOICE_Y, w, CHOICE_H),
             create_link: Rect::new(MARGIN, CHOICE_Y + CHOICE_H + CHOICE_GAP, w, CHOICE_H),
             mirror_toggle: Rect::new(MARGIN, MIRROR_ROW_Y, w, CHOICE_H),
+            launch_home: Rect::new(MARGIN, LAUNCH_ROW_Y, half, CHOICE_H),
+            launch_today: Rect::new(
+                MARGIN + half + CHOICE_GAP,
+                LAUNCH_ROW_Y,
+                w.saturating_sub(half + CHOICE_GAP),
+                CHOICE_H,
+            ),
         }
     }
 
@@ -159,12 +177,19 @@ impl PreferencesLayout {
         if self.mirror_toggle.contains(x, y) {
             return Some(PreferencesHit::MirrorToggle);
         }
+        if self.launch_home.contains(x, y) {
+            return Some(PreferencesHit::LaunchHome);
+        }
+        if self.launch_today.contains(x, y) {
+            return Some(PreferencesHit::LaunchToday);
+        }
         None
     }
 }
 
 const SIDE_BUTTON_BLURB: &str = "Choose what the pen side button does while you are on a page.";
 const MIRROR_BLURB: &str = "Keep a read-only copy of your Kindle notebooks in the Amazon folder.";
+const LAUNCH_BLURB: &str = "Where Ignite goes when it starts.";
 
 pub fn mirror_toggle_label(enabled: bool) -> &'static str {
     if enabled {
@@ -179,6 +204,7 @@ pub fn render_preferences(
     geo: &FbGeometry,
     action: SideButtonAction,
     mirror_enabled: bool,
+    open_at_launch: OpenAtLaunch,
 ) -> Result<(), String> {
     let layout = PreferencesLayout::new(geo);
     let mut c = Canvas::new(fb, geo)?;
@@ -231,6 +257,24 @@ pub fn render_preferences(
             "Tap to turn on."
         },
         BLACK,
+    );
+    c.text(MARGIN, LAUNCH_SECTION_Y, 9, "OPEN AT LAUNCH", BLACK);
+    for (i, line) in wrap_text(LAUNCH_BLURB, 6, w, 1).iter().enumerate() {
+        c.text(MARGIN, LAUNCH_BODY_Y + i as u32 * 64, 6, line, BLACK);
+    }
+    paint_choice(
+        &mut c,
+        layout.launch_home,
+        "Home",
+        "Your notebooks.",
+        open_at_launch == OpenAtLaunch::Home,
+    );
+    paint_choice(
+        &mut c,
+        layout.launch_today,
+        "Today",
+        "Today's daily page.",
+        open_at_launch == OpenAtLaunch::Today,
     );
     Ok(())
 }
@@ -295,13 +339,58 @@ mod tests {
         assert_eq!(mirror_toggle_label(false), "Mirror Amazon notebooks: Off");
         let mut fb = vec![0x55; g.smem_len as usize];
         for mirror in [false, true] {
-            render_preferences(&mut fb, &g, SideButtonAction::NavigationUndo, mirror).unwrap();
-            render_preferences(&mut fb, &g, SideButtonAction::CreateLink, mirror).unwrap();
+            let home = OpenAtLaunch::Home;
+            render_preferences(&mut fb, &g, SideButtonAction::NavigationUndo, mirror, home)
+                .unwrap();
+            render_preferences(&mut fb, &g, SideButtonAction::CreateLink, mirror, home).unwrap();
             for y in 0..g.yres as usize {
                 let pad = &fb[y * g.line_length as usize + g.xres as usize
                     ..(y + 1) * g.line_length as usize];
                 assert!(pad.iter().all(|b| *b == 0x55));
             }
+        }
+    }
+
+    #[test]
+    fn open_at_launch_rows_fit_below_the_mirror_and_hit() {
+        let g = panel_geo();
+        let l = PreferencesLayout::new(&g);
+        assert!(l.launch_home.y >= l.mirror_toggle.bottom() + CHOICE_GAP);
+        // Side by side: [Home] [Today], spanning the mirror row's width.
+        assert_eq!(l.launch_today.y, l.launch_home.y);
+        assert_eq!(l.launch_today.x, l.launch_home.right() + CHOICE_GAP);
+        assert_eq!(l.launch_home.x, l.mirror_toggle.x);
+        assert_eq!(l.launch_today.right(), l.mirror_toggle.right());
+        assert_eq!((l.launch_home.h, l.launch_today.h), (CHOICE_H, CHOICE_H));
+        // The last row ends above the bottom margin and the version label.
+        let version_top = g.yres - MARGIN - GLYPH_H * VERSION_SCALE;
+        assert!(
+            l.launch_today.bottom() < g.yres - 60,
+            "{:?}",
+            l.launch_today
+        );
+        assert!(
+            l.launch_today.bottom() < version_top,
+            "{:?}",
+            l.launch_today
+        );
+        let (x, y) = center(l.launch_home);
+        assert_eq!(l.hit(x, y), Some(PreferencesHit::LaunchHome));
+        let (x, y) = center(l.launch_today);
+        assert_eq!(l.hit(x, y), Some(PreferencesHit::LaunchToday));
+        assert_eq!(l.hit(l.launch_home.right() + 1, y), None);
+        assert_eq!(l.hit(x, l.launch_today.bottom() + 1), None);
+        let mut fb = vec![0x55; g.smem_len as usize];
+        for launch in [OpenAtLaunch::Home, OpenAtLaunch::Today] {
+            render_preferences(&mut fb, &g, SideButtonAction::NavigationUndo, true, launch)
+                .unwrap();
+            // The selected row is filled black.
+            let r = match launch {
+                OpenAtLaunch::Home => l.launch_home,
+                OpenAtLaunch::Today => l.launch_today,
+            };
+            let px = fb[((r.y + 10) * g.line_length + r.x + 10) as usize];
+            assert_eq!(px, BLACK);
         }
     }
 

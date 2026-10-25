@@ -178,6 +178,14 @@ impl Modal {
         }
     }
 
+    /// TODAY (or open-at-launch Today) while the device clock looks unset.
+    pub fn clock_unset_notice() -> Self {
+        Self::Notice {
+            heading: "Clock not set".into(),
+            body: vec!["Set the Kindle clock first.".into()],
+        }
+    }
+
     /// COPY TO IGNITE on a mirror whose Kindle source was already imported.
     pub fn already_copied_notice() -> Self {
         Self::Notice {
