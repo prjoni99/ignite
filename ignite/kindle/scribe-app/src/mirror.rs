@@ -9,20 +9,33 @@
 //! written. The ledger lives in the Scribe library at `<library>/.scribe-mirror/ledger.json`
 //! and, like the import ledger, fails closed when it cannot be trusted.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nbk_reader::{DecodedNotebook, NbkError};
+use notebook_core::Stroke;
 use serde::{Deserialize, Serialize};
 
 use crate::folders::FolderStore;
-use crate::library::{rename_notebook_durable, LibraryRepository, RenameNotebookHooks};
-use crate::nbk_import::{
-    discover, write_atomic, GlobalSync, ImportSources, ImportSync, NoSync, SourceNotebook,
+use crate::library::{
+    allocate_fresh_notebook_id, read_notebook_manifest_read_only, rename_notebook_durable,
+    LibraryRepository, RenameNotebookHooks,
 };
-use crate::notebook::{delete_page_durable, DeletePageHooks, PersistedNotebookManifestV1};
+use crate::nbk_import::{
+    build, convert, discover, write_atomic, GlobalSync, ImportSources, ImportSync, ImportTarget,
+    NoSync, SourceNotebook, STROKES_PER_FSYNC,
+};
+use crate::notebook::{
+    delete_page_durable, insert_page_after_durable, DeletePageHooks, InsertPageHooks,
+    PersistedNotebookManifestV1,
+};
 use crate::runtime::{capture_folder_change, FolderCapture};
+use crate::store::load_existing_page;
+use crate::sync_outbound::DurableWaitError;
 
 // ------------------------------------------------------------------------------ constants
 
@@ -517,6 +530,454 @@ pub(crate) fn ensure_folder(
     // synced (harmless) folder is left that the next call will not reuse.
     ledger.set_folders(amazon, removed)?;
     Ok(id)
+}
+
+// ------------------------------------------------------------------------------ engine
+
+/// Immutable provenance written into each mirror notebook; its presence makes the notebook
+/// read-only by convention.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MirrorOriginV1 {
+    pub v: u32,
+    pub origin_kind: String,
+    pub origin_id: String,
+    pub mirrored_unix_ms: u64,
+}
+
+/// Where mirror notebooks live: the import target plus the library's folders.
+pub struct MirrorTarget<'a> {
+    pub import: ImportTarget<'a>,
+    pub folders: &'a mut FolderStore,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MirrorOutcome {
+    Done,
+    /// Transient: retried on a later scan; the ledger is untouched.
+    Skipped(String),
+    Failed(String),
+    /// Sync faulted/stopped or the wait was cancelled: the caller stops the run.
+    Halted(String),
+}
+
+/// Error prefixes of a halted step, as in `nbk_import`.
+const SYNC_HALT: &str = "sync halted";
+const CANCELLED: &str = "mirror cancelled";
+
+fn halt(e: DurableWaitError, what: &str) -> String {
+    match e {
+        DurableWaitError::Cancelled => format!("{CANCELLED} (waiting for {what})"),
+        e => format!("{SYNC_HALT} ({what}): {e}"),
+    }
+}
+
+/// Forwards to the caller's sync and remembers whether a flush failed, so any error out of
+/// the engine (including `nbk_import::build`'s) is classified as a halt exactly when sync
+/// stopped.
+struct Watch<'a> {
+    inner: &'a dyn MirrorSync,
+    halted: Cell<bool>,
+}
+
+impl ImportSync for Watch<'_> {
+    fn notebook_created(&self, library: &LibraryRepository, id: &str, title: &str) {
+        self.inner.notebook_created(library, id, title);
+    }
+    fn page_created(&self, dir: &Path, nb: &str, page: &str, after: &str) {
+        self.inner.page_created(dir, nb, page, after);
+    }
+    fn strokes_committed(&self, nb: &str, page: &str, strokes: &[Stroke]) {
+        self.inner.strokes_committed(nb, page, strokes);
+    }
+    fn flush(&self, cancel: &AtomicBool) -> Result<(), DurableWaitError> {
+        let r = self.inner.flush(cancel);
+        if r.is_err() {
+            self.halted.set(true);
+        }
+        r
+    }
+    fn delete_notebook(&self, library: &mut LibraryRepository, id: &str) -> Result<(), String> {
+        self.inner.delete_notebook(library, id)
+    }
+}
+
+impl MirrorSync for Watch<'_> {
+    fn delete_page(
+        &self,
+        nb_dir: &Path,
+        manifest: &mut PersistedNotebookManifestV1,
+        notebook_id: &str,
+        page_id: &str,
+    ) -> Result<(), String> {
+        self.inner
+            .delete_page(nb_dir, manifest, notebook_id, page_id)
+    }
+    fn rename_notebook(
+        &self,
+        library: &mut LibraryRepository,
+        notebook_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        self.inner.rename_notebook(library, notebook_id, title)
+    }
+    fn folder_changed(&self, folders: &FolderStore, change: FolderCapture) {
+        self.inner.folder_changed(folders, change);
+    }
+}
+
+/// Decode an Amazon notebook directory (in-memory copies; the source is never written).
+pub fn kindle_decode(dir: &Path) -> Result<DecodedNotebook, NbkError> {
+    nbk_reader::read_source(dir).and_then(|s| nbk_reader::decode_snapshot(&s))
+}
+
+/// The entry's notebook, when it is in the library and its marker names this origin. An id
+/// reserved by a create that never happened may since belong to a user notebook; that one is
+/// never touched.
+fn mirror_notebook(library: &LibraryRepository, e: &MirrorEntryV1) -> Option<String> {
+    let dest = e.dest_notebook_id.as_ref()?;
+    if !library.manifest().notebook_ids.contains(dest) {
+        return None;
+    }
+    let b = fs::read(library.notebook_dir(dest).join(MIRROR_MARKER)).ok()?;
+    let m: MirrorOriginV1 = serde_json::from_slice(&b).ok()?;
+    (m.origin_id == e.origin_id).then(|| dest.clone())
+}
+
+/// Perform one action. `decode` is injected so tests can hand in a [`DecodedNotebook`]
+/// without private samples. Amazon state is only ever read (through `decode`).
+pub(crate) fn apply_one(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    action: &MirrorAction,
+    decode: &dyn Fn(&Path) -> Result<DecodedNotebook, NbkError>,
+    sync: &dyn MirrorSync,
+) -> MirrorOutcome {
+    let _admit = match crate::sync_verified::note_library_mutation(t.import.library.root()) {
+        Ok(a) => a,
+        Err(e) => return MirrorOutcome::Failed(e),
+    };
+    let w = Watch {
+        inner: sync,
+        halted: Cell::new(false),
+    };
+    let r = (|| {
+        // Sync must be healthy and caught up before anything changes.
+        w.flush(t.import.cancel)
+            .map_err(|e| halt(e, "mirror start"))?;
+        match action {
+            MirrorAction::Create { source, stamp }
+            | MirrorAction::Rebuild { source, stamp }
+            | MirrorAction::Restore { source, stamp } => {
+                mirror_content(t, ledger, source, *stamp, decode, &w)
+            }
+            MirrorAction::Rename { source } => rename(t, ledger, source, &w),
+            MirrorAction::Remove { origin_id } => remove(t, ledger, origin_id, &w),
+        }
+    })();
+    match r {
+        Ok(o) => o,
+        // A Rebuilding entry stays Rebuilding: startup recovery removes the partial notebook.
+        Err(e) if w.halted.get() => MirrorOutcome::Halted(e),
+        Err(e) => MirrorOutcome::Failed(e),
+    }
+}
+
+/// Create, rebuild or restore: decode, then (unless the content is unchanged) rebuild the
+/// mirror notebook in place, or build a fresh one when none is left.
+fn mirror_content(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    source: &SourceNotebook,
+    stamp: SourceStamp,
+    decode: &dyn Fn(&Path) -> Result<DecodedNotebook, NbkError>,
+    sync: &Watch<'_>,
+) -> Result<MirrorOutcome, String> {
+    let prev = ledger.data.entries.get(&source.origin_id).cloned();
+    // Decode and convert fully in memory; nothing is written before this succeeds.
+    let decoded = match decode(&source.dir) {
+        Ok(d) => d,
+        Err(e) => {
+            return match classify_decode_error(&e) {
+                DecodeFailure::Transient(why) => Ok(MirrorOutcome::Skipped(why)),
+                DecodeFailure::Permanent(why) => unsupported(ledger, prev, source, stamp, why),
+            }
+        }
+    };
+    let pages = match convert(&decoded) {
+        Ok((p, _)) if p.is_empty() => {
+            let why = "NBK_UNSUPPORTED: notebook has no pages".to_string();
+            return unsupported(ledger, prev, source, stamp, why);
+        }
+        Ok((p, _)) => p,
+        Err(why) => return unsupported(ledger, prev, source, stamp, why),
+    };
+    let hash = content_hash(&decoded);
+    let live = prev
+        .as_ref()
+        .and_then(|e| mirror_notebook(t.import.library, e));
+
+    if let (Some(dest), Some(p)) = (&live, &prev) {
+        if p.content_sha256.as_deref() == Some(hash.as_str()) {
+            // Same drawn content: no page is touched.
+            let entry = MirrorEntryV1 {
+                title: source.title.clone(),
+                dest_notebook_id: Some(dest.clone()),
+                stamp: Some(stamp),
+                ..p.clone()
+            };
+            return finish(t, ledger, entry, sync);
+        }
+    }
+
+    // Durable intent before the first native mutation.
+    let in_place = live.is_some();
+    let dest = live.unwrap_or_else(|| allocate_fresh_notebook_id(t.import.library));
+    let mut entry = MirrorEntryV1 {
+        origin_id: source.origin_id.clone(),
+        title: source.title.clone(),
+        state: MirrorState::Rebuilding,
+        dest_notebook_id: Some(dest.clone()),
+        stamp: prev.as_ref().and_then(|p| p.stamp),
+        content_sha256: None,
+        pages: prev.as_ref().map_or(0, |p| p.pages),
+        error: None,
+        updated_unix_ms: now_ms(),
+    };
+    ledger.put(entry.clone())?;
+
+    entry.pages = if in_place {
+        replace_pages(t, &dest, &pages, sync)?
+    } else {
+        let origin = MirrorOriginV1 {
+            v: 1,
+            origin_kind: ORIGIN_KIND.into(),
+            origin_id: source.origin_id.clone(),
+            mirrored_unix_ms: now_ms(),
+        };
+        let bytes = serde_json::to_vec_pretty(&origin).map_err(|e| e.to_string())?;
+        build(
+            &mut t.import,
+            &dest,
+            &source.title,
+            &pages,
+            (MIRROR_MARKER, &bytes),
+            sync,
+        )?;
+        pages.len()
+    };
+    entry.stamp = Some(stamp);
+    entry.content_sha256 = Some(hash);
+    finish(t, ledger, entry, sync)
+}
+
+/// New pages after the current last page, their strokes, then the old pages in order: the
+/// notebook never has fewer than one page. Returns the final page count.
+fn replace_pages(
+    t: &mut MirrorTarget<'_>,
+    dest: &str,
+    pages: &[Vec<Stroke>],
+    sync: &dyn MirrorSync,
+) -> Result<usize, String> {
+    let lib = &mut *t.import.library;
+    let cancel = t.import.cancel;
+    let nb_dir = lib.notebook_dir(dest);
+    let mut manifest = read_notebook_manifest_read_only(&nb_dir)?;
+    let old = manifest.page_ids.clone();
+    let mut fresh = Vec::with_capacity(pages.len());
+    for _ in pages {
+        let after = manifest
+            .page_ids
+            .last()
+            .cloned()
+            .ok_or("notebook has no page")?;
+        let commit =
+            insert_page_after_durable(&nb_dir, &mut manifest, &after, &InsertPageHooks::default())?;
+        sync.page_created(&nb_dir, dest, &commit.inserted_page_id, &after);
+        sync.flush(cancel).map_err(|e| halt(e, "page create"))?;
+        fresh.push(commit.inserted_page_id);
+    }
+    lib.set_cached_page_count(dest, manifest.page_ids.len());
+    for (page_id, strokes) in fresh.iter().zip(pages) {
+        if strokes.is_empty() {
+            continue;
+        }
+        let (mut store, _) = load_existing_page(&nb_dir, page_id)?;
+        for chunk in strokes.chunks(STROKES_PER_FSYNC) {
+            store.append_committed_strokes(chunk)?;
+            sync.strokes_committed(dest, page_id, chunk);
+            // Backpressure: this batch's captures are durable before the next is written.
+            sync.flush(cancel).map_err(|e| halt(e, "strokes"))?;
+        }
+    }
+    for page_id in &old {
+        let r = sync.delete_page(&nb_dir, &mut manifest, dest, page_id);
+        lib.set_cached_page_count(dest, manifest.page_ids.len());
+        r?;
+        sync.flush(cancel).map_err(|e| halt(e, "page delete"))?;
+    }
+    Ok(manifest.page_ids.len())
+}
+
+/// File the notebook into `which` (unless it is already there).
+fn file_into(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    notebook_id: &str,
+    which: Which,
+    sync: &dyn MirrorSync,
+) -> Result<(), String> {
+    let live = t.import.library.manifest().notebook_ids.clone();
+    let folder = ensure_folder(ledger, t.folders, &live, which, sync)?;
+    if t.folders.folder_of(notebook_id) == Some(folder.as_str()) {
+        return Ok(());
+    }
+    t.folders.set_folder(notebook_id, Some(&folder), &live)?;
+    sync.folder_changed(
+        t.folders,
+        FolderCapture::Filed {
+            notebook: notebook_id.into(),
+            folder: Some(folder),
+        },
+    );
+    Ok(())
+}
+
+/// File the notebook under Amazon with the source title, then mark the entry `Current` once
+/// every capture is durable.
+fn finish(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    mut entry: MirrorEntryV1,
+    sync: &dyn MirrorSync,
+) -> Result<MirrorOutcome, String> {
+    let dest = entry
+        .dest_notebook_id
+        .clone()
+        .ok_or("mirror entry has no notebook")?;
+    file_into(t, ledger, &dest, Which::Amazon, sync)?;
+    if t.import.library.title(&dest).ok() != Some(entry.title.as_str()) {
+        sync.rename_notebook(t.import.library, &dest, &entry.title)?;
+    }
+    sync.flush(t.import.cancel)
+        .map_err(|e| halt(e, "mirror finish"))?;
+    entry.state = MirrorState::Current;
+    entry.error = None;
+    entry.updated_unix_ms = now_ms();
+    ledger.put(entry)?;
+    Ok(MirrorOutcome::Done)
+}
+
+/// A source that will not decode as-is: remember its stamp and why (so it is not retried
+/// until it changes); any existing mirror notebook is kept as it is.
+fn unsupported(
+    ledger: &mut MirrorLedger,
+    prev: Option<MirrorEntryV1>,
+    source: &SourceNotebook,
+    stamp: SourceStamp,
+    why: String,
+) -> Result<MirrorOutcome, String> {
+    let base = prev.unwrap_or_else(|| MirrorEntryV1 {
+        origin_id: source.origin_id.clone(),
+        title: source.title.clone(),
+        state: MirrorState::Unsupported,
+        dest_notebook_id: None,
+        stamp: None,
+        content_sha256: None,
+        pages: 0,
+        error: None,
+        updated_unix_ms: 0,
+    });
+    ledger.put(MirrorEntryV1 {
+        state: MirrorState::Unsupported,
+        stamp: Some(stamp),
+        error: Some(why.clone()),
+        updated_unix_ms: now_ms(),
+        ..base
+    })?;
+    Ok(MirrorOutcome::Failed(why))
+}
+
+fn rename(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    source: &SourceNotebook,
+    sync: &dyn MirrorSync,
+) -> Result<MirrorOutcome, String> {
+    let Some(mut e) = ledger.data.entries.get(&source.origin_id).cloned() else {
+        return Err(format!("no mirror entry for {}", source.origin_id));
+    };
+    if let Some(dest) = mirror_notebook(t.import.library, &e) {
+        if t.import.library.title(&dest).ok() != Some(source.title.as_str()) {
+            sync.rename_notebook(t.import.library, &dest, &source.title)?;
+            sync.flush(t.import.cancel).map_err(|e| halt(e, "rename"))?;
+        }
+    }
+    e.title = source.title.clone();
+    e.updated_unix_ms = now_ms();
+    ledger.put(e)?;
+    Ok(MirrorOutcome::Done)
+}
+
+/// The source is gone: its mirror moves to the Removed folder (never deleted); an entry that
+/// never built anything is forgotten.
+fn remove(
+    t: &mut MirrorTarget<'_>,
+    ledger: &mut MirrorLedger,
+    origin_id: &str,
+    sync: &dyn MirrorSync,
+) -> Result<MirrorOutcome, String> {
+    let Some(mut e) = ledger.data.entries.get(origin_id).cloned() else {
+        return Ok(MirrorOutcome::Done);
+    };
+    if e.dest_notebook_id.is_none() {
+        ledger.remove(origin_id)?;
+        return Ok(MirrorOutcome::Done);
+    }
+    if let Some(dest) = mirror_notebook(t.import.library, &e) {
+        file_into(t, ledger, &dest, Which::Removed, sync)?;
+        sync.flush(t.import.cancel).map_err(|e| halt(e, "remove"))?;
+    }
+    e.state = MirrorState::Removed;
+    e.updated_unix_ms = now_ms();
+    ledger.put(e)?;
+    Ok(MirrorOutcome::Done)
+}
+
+/// Startup: every `Rebuilding` entry's notebook is removed through the synced delete path and
+/// the entry dropped (so the next scan recreates it). Runs before any UI, next to the
+/// `nbk_import` recovery. Returns how many entries were recovered.
+pub(crate) fn recover_interrupted(
+    library: &mut LibraryRepository,
+    sync: &dyn MirrorSync,
+) -> Result<usize, String> {
+    let mut ledger = MirrorLedger::open(library.root())?;
+    let stuck: Vec<MirrorEntryV1> = ledger
+        .data
+        .entries
+        .values()
+        .filter(|e| e.state == MirrorState::Rebuilding)
+        .cloned()
+        .collect();
+    let mut recovered = 0;
+    let mut errors = Vec::new();
+    for e in stuck {
+        if let Some(dest) = mirror_notebook(library, &e) {
+            if let Err(why) = sync.delete_notebook(library, &dest) {
+                errors.push(format!("{} ({dest}): {why}", e.origin_id));
+                continue;
+            }
+        }
+        match ledger.remove(&e.origin_id) {
+            Ok(()) => recovered += 1,
+            Err(why) => errors.push(format!("{}: {why}", e.origin_id)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(recovered)
+    } else {
+        Err(format!("mirror recovery: {}", errors.join("; ")))
+    }
 }
 
 #[cfg(test)]

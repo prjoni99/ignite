@@ -71,6 +71,24 @@ pub(crate) fn sample(uuid: &str) -> PathBuf {
     samples_root().join(uuid)
 }
 
+/// Sample id of fixture `role` from the private manifest at `IGNITE_NBK_IMPORT_FIXTURES`
+/// (`{"version":1,"roles":{"<role>":{"id":..}}}`; the NBK import tests validate it fully).
+pub(crate) fn fixture_role_id(role: &str) -> String {
+    let raw = std::env::var("IGNITE_NBK_IMPORT_FIXTURES").unwrap_or_default();
+    let path = PathBuf::from(raw.trim());
+    assert!(
+        path.is_absolute(),
+        "IGNITE_NBK_IMPORT_FIXTURES must be an absolute fixture manifest path"
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).unwrap()).expect("fixture manifest JSON");
+    v["roles"][role]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("fixture manifest has no role {role}"))
+        .trim()
+        .to_string()
+}
+
 /// Fake Kindle: `.notebooks/<id>/` copies + catalog.
 pub(crate) struct Kindle {
     pub(crate) root: PathBuf,
@@ -204,6 +222,23 @@ impl Kindle {
                 );
             }
         }
+        out
+    }
+
+    /// Path, length and mtime of everything under the fake Kindle (both the notebooks root
+    /// and the catalog), directories included, so even a stray journal file shows up.
+    pub(crate) fn tree_stat(&self) -> BTreeMap<PathBuf, (u64, SystemTime)> {
+        fn walk(p: &std::path::Path, out: &mut BTreeMap<PathBuf, (u64, SystemTime)>) {
+            let m = fs::symlink_metadata(p).unwrap();
+            out.insert(p.to_path_buf(), (m.len(), m.modified().unwrap()));
+            if m.is_dir() {
+                for e in fs::read_dir(p).unwrap() {
+                    walk(&e.unwrap().path(), out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(self.root.parent().unwrap(), &mut out);
         out
     }
 }
