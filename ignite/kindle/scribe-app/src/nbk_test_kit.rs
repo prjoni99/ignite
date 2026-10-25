@@ -194,6 +194,11 @@ impl Kindle {
         fs::remove_dir_all(self.root.join(id)).unwrap();
     }
 
+    /// Drop only a source's directory; its catalog row stays listed.
+    pub(crate) fn remove_dir_only(&self, id: &str) {
+        fs::remove_dir_all(self.root.join(id)).unwrap();
+    }
+
     /// Append one byte to the source's `actions.log` so its stamp changes.
     pub(crate) fn touch(&self, id: &str) {
         let mut f = fs::OpenOptions::new()

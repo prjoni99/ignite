@@ -266,6 +266,52 @@ fn a_source_vanishing_between_discover_and_stamp_is_skipped() {
 }
 
 #[test]
+fn a_missing_notebooks_root_takes_no_action() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    let before = l.data.clone();
+    fs::remove_dir_all(&k.root).unwrap();
+    assert_eq!(scan(&k.sources(), &l).unwrap(), MirrorScan::default());
+    assert_eq!(l.data, before);
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, before);
+}
+
+#[test]
+fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    k.add_synthetic(ID_B, "Two");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    l.put(entry_at(&k, ID_B, "Two", MirrorState::Current))
+        .unwrap();
+    k.remove_dir_only(ID_A);
+    k.touch(ID_B);
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
+    assert!(!got
+        .actions
+        .iter()
+        .any(|a| matches!(a, MirrorAction::Remove { .. })));
+    assert!(got.unsupported.is_empty());
+    assert_eq!(got.current, 0);
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source, .. }] if source.origin_id == ID_B
+    ));
+    // Still listed but the `nbk` alone is missing: also skipped, never removed.
+    fs::create_dir_all(k.root.join(ID_A)).unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
+}
+
+#[test]
 fn rebuilding_and_stampless_unsupported_sources_that_are_present_rebuild() {
     let k = Kindle::new();
     k.add_synthetic(ID_A, "Half");

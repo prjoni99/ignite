@@ -27,7 +27,7 @@ use crate::library::{
     LibraryRepository, RenameNotebookHooks,
 };
 use crate::nbk_import::{
-    build, convert, discover, halt, insert_pages_after, write_atomic, write_page_strokes,
+    build, convert, discover_listed, halt, insert_pages_after, write_atomic, write_page_strokes,
     GlobalSync, ImportSources, ImportSync, ImportTarget, NoSync, SourceNotebook,
 };
 use crate::notebook::{delete_page_durable, DeletePageHooks, PersistedNotebookManifestV1};
@@ -274,21 +274,25 @@ pub struct MirrorScan {
 }
 
 /// Classify every Amazon notebook against the ledger. Metadata only, never decodes.
-/// `discover`'s error is returned as-is; a missing catalog or notebooks root is just empty.
+/// `discover_listed`'s error is returned as-is. A missing catalog or notebooks root takes no
+/// action, and a source the catalog lists but whose directory or `nbk` is missing is skipped:
+/// only an origin the catalog no longer lists (or lists as deleted) is removed.
 pub fn scan(src: &ImportSources, ledger: &MirrorLedger) -> Result<MirrorScan, String> {
     // A configured catalog that is missing gives only an untrusted directory listing (every
     // title would fall back); take no action rather than rename or remove from that view.
-    if src.catalog.as_ref().is_some_and(|c| !c.is_file()) {
+    // A missing notebooks root (storage not mounted, mid-sync) is the same: pause, never remove.
+    if src.catalog.as_ref().is_some_and(|c| !c.is_file()) || !src.notebooks_root.is_dir() {
         return Ok(MirrorScan::default());
     }
-    let sources = discover(src)?;
+    let sources = discover_listed(src)?;
     let mut out = MirrorScan::default();
     let mut present = std::collections::BTreeSet::new();
     for source in sources {
         present.insert(source.origin_id.clone());
         let stamp = match try_stamp(&source.dir) {
             Ok(st) => st,
-            // Deleted between discover and stamp: skip it this round (no action either way).
+            // Listed but its directory or `nbk` is missing (or deleted between discover and
+            // stamp): present but skipped this round, no action either way.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 continue;
             }

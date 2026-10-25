@@ -163,6 +163,21 @@ pub fn native_title(raw: Option<&str>) -> String {
 
 /// Standalone Amazon notebooks available locally (catalog order independent; sorted by title).
 pub fn discover(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
+    discover_filtered(src, true)
+}
+
+/// Like [`discover`], but a catalog row that is listed, not deleted and a standalone notebook
+/// is returned even when its directory or `nbk` file is missing. With no catalog (dev config)
+/// this is the same directory listing as [`discover`]. The mirror uses it so that a source the
+/// catalog still lists is never treated as removed.
+pub(crate) fn discover_listed(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
+    discover_filtered(src, false)
+}
+
+fn discover_filtered(
+    src: &ImportSources,
+    require_nbk: bool,
+) -> Result<Vec<SourceNotebook>, String> {
     let has_nbk = |id: &str| src.notebooks_root.join(id).join("nbk").is_file();
     let mut out = Vec::new();
     match src.catalog.as_ref().filter(|p| p.is_file()) {
@@ -173,7 +188,7 @@ pub fn discover(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
                 if e.node_type.as_deref() == Some(STANDALONE_NOTEBOOK)
                     && !e.deleted
                     && is_uuid_like(&e.uuid)
-                    && has_nbk(&e.uuid)
+                    && (!require_nbk || has_nbk(&e.uuid))
                 {
                     out.push(SourceNotebook {
                         title: native_title(e.title.as_deref()),
