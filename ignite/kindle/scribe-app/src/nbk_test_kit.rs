@@ -128,6 +128,25 @@ impl Kindle {
         .unwrap();
     }
 
+    /// A source that needs no private sample: a stub `nbk` that is never decoded, plus the
+    /// catalog row (same SQL as [`Kindle::add`]).
+    pub(crate) fn add_synthetic(&self, id: &str, title: &str) {
+        let dir = self.root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("nbk"), b"SQLite format 3\0 not a notebook").unwrap();
+        let c = rusqlite::Connection::open(&self.catalog).unwrap();
+        c.execute(
+            "INSERT OR REPLACE INTO Nodes (uuid, title_collation, node_type, additional_data)
+             VALUES (?1, ?2, 'STANDALONE_NOTEBOOK', ?3)",
+            rusqlite::params![
+                id,
+                title,
+                format!(r#"{{"title":"{title}","notebook_template":"plain","delete_state":0}}"#)
+            ],
+        )
+        .unwrap();
+    }
+
     /// Replace a source's content (the Amazon notebook was edited on the Kindle).
     pub(crate) fn set_content(&self, id: &str, from: &str) {
         let dir = self.root.join(id);
@@ -149,8 +168,6 @@ impl Kindle {
         .unwrap();
     }
 
-    // Consumed by the mirror tests (later tasks).
-    #[allow(dead_code)]
     /// Drop a source notebook: its catalog row and its directory.
     pub(crate) fn remove(&self, id: &str) {
         let c = rusqlite::Connection::open(&self.catalog).unwrap();
@@ -159,7 +176,6 @@ impl Kindle {
         fs::remove_dir_all(self.root.join(id)).unwrap();
     }
 
-    #[allow(dead_code)]
     /// Append one byte to the source's `actions.log` so its stamp changes.
     pub(crate) fn touch(&self, id: &str) {
         let mut f = fs::OpenOptions::new()

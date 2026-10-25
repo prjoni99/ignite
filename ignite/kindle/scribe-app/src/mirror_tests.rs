@@ -1,0 +1,234 @@
+use super::*;
+use crate::nbk_test_kit::*;
+use std::fs;
+
+const ID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
+const ID_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
+const ID_C: &str = "cccccccc-0000-0000-0000-000000000003";
+const ID_D: &str = "dddddddd-0000-0000-0000-000000000004";
+const ID_E: &str = "eeeeeeee-0000-0000-0000-000000000005";
+
+fn entry(id: &str, state: MirrorState) -> MirrorEntryV1 {
+    MirrorEntryV1 {
+        origin_id: id.into(),
+        title: "One".into(),
+        state,
+        dest_notebook_id: Some(format!("dest-{id}")),
+        stamp: None,
+        content_sha256: None,
+        pages: 0,
+        error: None,
+        updated_unix_ms: 1,
+    }
+}
+
+fn entry_at(k: &Kindle, id: &str, title: &str, state: MirrorState) -> MirrorEntryV1 {
+    MirrorEntryV1 {
+        title: title.into(),
+        stamp: Some(stamp_source(&k.root.join(id)).unwrap()),
+        ..entry(id, state)
+    }
+}
+
+#[test]
+fn ledger_round_trips_and_a_corrupt_ledger_fails_closed() {
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry("a", MirrorState::Current)).unwrap();
+    l.set_folders(Some("f1".into()), Some("f2".into())).unwrap();
+    l.note_scan(Some("boom".into())).unwrap();
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, l.data);
+    assert_eq!(l.data.v, 1);
+    assert!(l.data.last_scan_unix_ms.is_some());
+    l.remove("a").unwrap();
+    assert!(MirrorLedger::open(s.lib.root())
+        .unwrap()
+        .data
+        .entries
+        .is_empty());
+    fs::write(MirrorLedger::path_for(s.lib.root()), b"{").unwrap();
+    assert!(MirrorLedger::open(s.lib.root())
+        .unwrap_err()
+        .contains("REFUSE MIRROR"));
+    fs::write(
+        MirrorLedger::path_for(s.lib.root()),
+        br#"{"v":2,"entries":{},"amazon_folder":null,"removed_folder":null,"last_scan_unix_ms":null,"last_scan_error":null}"#,
+    )
+    .unwrap();
+    assert!(MirrorLedger::open(s.lib.root())
+        .unwrap_err()
+        .contains("REFUSE MIRROR"));
+}
+
+#[test]
+fn a_failed_ledger_write_keeps_memory_equal_to_disk() {
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry("a", MirrorState::Current)).unwrap();
+    let before = l.data.clone();
+    // A directory where the temp file goes makes every write fail.
+    let tmp = MirrorLedger::path_for(s.lib.root()).with_extension("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    assert!(l.put(entry("b", MirrorState::Current)).is_err());
+    assert!(l.remove("a").is_err());
+    assert!(l.set_folders(Some("x".into()), None).is_err());
+    assert_eq!(l.data, before);
+}
+
+#[test]
+fn stamp_changes_when_actions_log_or_nbk_changes_and_ignores_title() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let dir = k.root.join(ID_A);
+    let a = stamp_source(&dir).unwrap();
+    assert_eq!((a.actions_len, a.actions_mtime_ms), (0, 0));
+    assert!(a.nbk_len > 0);
+    k.rename(ID_A, "Two");
+    assert_eq!(a, stamp_source(&dir).unwrap());
+    k.touch(ID_A);
+    let b = stamp_source(&dir).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(b.actions_len, 1);
+    fs::write(dir.join("nbk"), b"SQLite format 3\0 not a notebook, longer").unwrap();
+    assert_ne!(b, stamp_source(&dir).unwrap());
+}
+
+#[test]
+fn scan_classifies_create_rebuild_rename_restore_and_remove() {
+    let k = Kindle::new();
+    for (id, t) in [
+        (ID_A, "New"),
+        (ID_B, "Edited"),
+        (ID_C, "Renamed"),
+        (ID_D, "Back"),
+    ] {
+        k.add_synthetic(id, t);
+    }
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    // B: stamped, then edited on the Kindle.
+    l.put(entry_at(&k, ID_B, "Edited", MirrorState::Current))
+        .unwrap();
+    k.touch(ID_B);
+    // C: same stamp, old title.
+    l.put(entry_at(&k, ID_C, "Old title", MirrorState::Current))
+        .unwrap();
+    // D: removed earlier, source is back.
+    l.put(entry_at(&k, ID_D, "Back", MirrorState::Removed))
+        .unwrap();
+    // E: mirrored, then the notebook was deleted on the Kindle.
+    k.add_synthetic(ID_E, "Gone");
+    l.put(entry_at(&k, ID_E, "Gone", MirrorState::Current)).unwrap();
+    k.remove(ID_E);
+
+    let sources = k.sources();
+    let got = scan(&sources, &l).unwrap();
+    let src = |id: &str, title: &str| SourceNotebook {
+        origin_id: id.into(),
+        title: title.into(),
+        dir: k.root.join(id),
+    };
+    let st = |id: &str| stamp_source(&k.root.join(id)).unwrap();
+    assert_eq!(
+        got.actions,
+        vec![
+            MirrorAction::Create {
+                source: src(ID_A, "New"),
+                stamp: st(ID_A)
+            },
+            MirrorAction::Rebuild {
+                source: src(ID_B, "Edited"),
+                stamp: st(ID_B)
+            },
+            MirrorAction::Rename {
+                source: src(ID_C, "Renamed")
+            },
+            MirrorAction::Restore {
+                source: src(ID_D, "Back"),
+                stamp: st(ID_D)
+            },
+            MirrorAction::Remove {
+                origin_id: ID_E.into()
+            },
+        ]
+    );
+    assert_eq!(got.current, 0);
+    assert!(got.unsupported.is_empty());
+}
+
+#[test]
+fn scan_counts_current_and_handles_absent_sources_by_state() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "Same");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "Same", MirrorState::Current))
+        .unwrap();
+    l.put(entry(ID_B, MirrorState::Unsupported)).unwrap();
+    l.put(entry(ID_C, MirrorState::Rebuilding)).unwrap();
+    l.put(entry(ID_D, MirrorState::Removed)).unwrap();
+    let mut none = entry(ID_E, MirrorState::Rebuilding);
+    none.dest_notebook_id = None;
+    l.put(none).unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert_eq!(got.current, 1);
+    assert_eq!(
+        got.actions,
+        vec![
+            MirrorAction::Remove {
+                origin_id: ID_B.into()
+            },
+            MirrorAction::Remove {
+                origin_id: ID_C.into()
+            },
+            MirrorAction::Remove {
+                origin_id: ID_E.into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn scan_with_missing_catalog_and_root_is_empty_not_an_error() {
+    let k = Kindle::new();
+    fs::remove_dir_all(&k.root).unwrap();
+    fs::remove_file(&k.catalog).unwrap();
+    let s = Scribe::new();
+    let l = MirrorLedger::open(s.lib.root()).unwrap();
+    assert_eq!(scan(&k.sources(), &l).unwrap(), MirrorScan::default());
+}
+
+#[test]
+fn scan_skips_unsupported_sources_until_their_stamp_changes() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "Odd");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let mut e = entry_at(&k, ID_A, "Odd", MirrorState::Unsupported);
+    e.error = Some("unsupported layout".into());
+    l.put(e).unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(got.actions.is_empty());
+    assert_eq!(
+        got.unsupported,
+        vec![("Odd".into(), "unsupported layout".into())]
+    );
+    k.touch(ID_A);
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(got.unsupported.is_empty());
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { .. }]
+    ));
+}
+
+#[test]
+fn scan_is_stat_only_and_leaves_amazon_storage_untouched() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let before = k.fingerprint();
+    let s = Scribe::new();
+    let l = MirrorLedger::open(s.lib.root()).unwrap();
+    scan(&k.sources(), &l).unwrap();
+    assert_eq!(before, k.fingerprint());
+}

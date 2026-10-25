@@ -45,6 +45,7 @@ pub mod library;
 pub mod link_paint;
 pub mod link_picker;
 mod link_tests;
+pub mod mirror;
 pub mod modal;
 pub mod nav;
 pub mod nav_state;
