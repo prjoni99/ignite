@@ -1412,6 +1412,19 @@ fn a_rebuild_never_runs_while_a_page_is_open() {
     assert!(step_allowed(AppView::Tools, false, true));
     assert!(!step_allowed(AppView::Home, true, true));
     assert!(!step_allowed(AppView::Tools, false, false));
+    // The scan has the same gate: never between strokes with a page open.
+    for v in [
+        AppView::Notebook,
+        AppView::Sync,
+        AppView::Preferences,
+        AppView::LinkTargetPicker,
+    ] {
+        assert!(!scan_allowed(v, false, true));
+    }
+    assert!(scan_allowed(AppView::Home, false, true));
+    assert!(scan_allowed(AppView::Tools, false, true));
+    assert!(!scan_allowed(AppView::Home, true, true));
+    assert!(!scan_allowed(AppView::Home, false, false));
 }
 
 #[test]
@@ -1429,15 +1442,10 @@ fn a_scan_error_never_removes_existing_mirrors() {
         b"this is not a sqlite database at all, just garbage bytes",
     )
     .unwrap();
-    match scan(&k.sources(), &l) {
-        Err(_) => {}
-        Ok(got) => assert!(
-            !got.actions
-                .iter()
-                .any(|a| matches!(a, MirrorAction::Remove { .. })),
-            "a scan error must never remove: {got:?}"
-        ),
-    }
+    let err = scan(&k.sources(), &l).expect_err("a garbage catalog must fail the scan");
     assert_eq!(l.data, before);
-    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, before);
+    l.note_scan(Some(err.clone())).unwrap();
+    let reopened = MirrorLedger::open(s.lib.root()).unwrap();
+    assert_eq!(reopened.data.entries, before.entries);
+    assert_eq!(reopened.data.last_scan_error, Some(err));
 }

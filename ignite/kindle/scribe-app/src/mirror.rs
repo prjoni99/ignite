@@ -1042,6 +1042,12 @@ pub fn step_allowed(view: AppView, import_running: bool, sync_linked: bool) -> b
     matches!(view, AppView::Home | AppView::Tools) && !import_running && sync_linked
 }
 
+/// May a scan start now? Same gate as a step: the scan and its ledger fsync never run on the
+/// main thread between strokes with a page open.
+pub fn scan_allowed(view: AppView, import_running: bool, sync_linked: bool) -> bool {
+    step_allowed(view, import_running, sync_linked)
+}
+
 #[cfg(test)]
 #[path = "mirror_tests.rs"]
 mod tests;
