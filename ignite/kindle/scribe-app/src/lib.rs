@@ -102,6 +102,7 @@ mod sync_recovery_supervise_tests;
 pub mod sync_ui;
 pub mod sync_verified;
 pub mod templates;
+pub mod text_author;
 pub mod text_paint;
 pub mod tools_ui;
 pub mod touch;

@@ -66,7 +66,7 @@ use sync_protocol::{
     from_json, sha256_hex, to_canonical_json, BackgroundRef, FolderId, IdentityFileV1, LibraryId,
     LinkId, NotebookId, OperationId, PageId, PageSpec, ReplicaId, Sha256Hex, SnapshotNotebook,
     SnapshotPage, StrokeId, StrokeStyle, SyncEnvelopeV1, SyncOperationV1, SyncPageLink, SyncPoint,
-    SyncSnapshotV1, SyncStroke, ENVELOPE_VERSION,
+    SyncSnapshotV1, SyncStroke, SyncText, ENVELOPE_VERSION,
 };
 use uuid::Uuid;
 
@@ -2310,6 +2310,28 @@ impl OutboundSync {
                 notebook_id: nb,
                 page_id: pg,
                 link: link.clone(),
+            },
+        )
+    }
+
+    pub fn prepare_add_text(
+        &self,
+        notebook_local: &str,
+        page_local: &str,
+        text: &SyncText,
+    ) -> Option<PrepTicket> {
+        let Some((nb, pg)) = self.page_gid(notebook_local, page_local) else {
+            self.fail(format!(
+                "no sync identity for {notebook_local}/{page_local}"
+            ));
+            return None;
+        };
+        self.prepare_with(
+            OperationId::from_uuid(Uuid::now_v7()).unwrap(),
+            SyncOperationV1::AddText {
+                notebook_id: nb,
+                page_id: pg,
+                text: text.clone(),
             },
         )
     }
