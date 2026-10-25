@@ -12,6 +12,8 @@ pub mod chrome;
 #[cfg(unix)]
 pub mod clock;
 pub mod content;
+#[cfg(unix)]
+pub mod daily;
 pub mod discovery;
 pub mod display_events;
 pub mod eraser;
