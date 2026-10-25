@@ -569,6 +569,8 @@ struct Rec {
     ev: RefCell<Vec<String>>,
     flushes: Cell<usize>,
     fail_flush_at: Option<usize>,
+    /// The next `delete_page` fails (a non-halt error mid-rebuild).
+    fail_delete_page: Cell<bool>,
 }
 
 impl Rec {
@@ -577,6 +579,11 @@ impl Rec {
             fail_flush_at: Some(n),
             ..Default::default()
         }
+    }
+    fn failing_delete_page() -> Self {
+        let r = Self::default();
+        r.fail_delete_page.set(true);
+        r
     }
     fn push(&self, e: String) {
         self.ev.borrow_mut().push(e);
@@ -621,6 +628,9 @@ impl MirrorSync for Rec {
         page_id: &str,
     ) -> Result<(), String> {
         self.push(format!("delete_page:{page_id}:{}", manifest.page_ids.len()));
+        if self.fail_delete_page.replace(false) {
+            return Err("boom".into());
+        }
         NoSync.delete_page(nb_dir, manifest, notebook_id, page_id)
     }
     fn rename_notebook(
@@ -914,6 +924,7 @@ fn rebuild_creates_new_pages_before_deleting_old_ones_and_never_drops_below_one_
         assert_eq!(parts[1], old[k]);
         let len: usize = parts[2].parse().unwrap();
         assert!(len >= 2, "a delete would leave {} pages: {ev:?}", len - 1);
+        assert_eq!(ev[i + 1], "flush", "{ev:?}");
     }
     assert!(
         !ev.iter().any(|e| e.starts_with("notebook_created")),
@@ -1253,5 +1264,110 @@ fn mirrors_a_real_notebook_with_exact_geometry() {
         before,
         (r.k.fingerprint(), r.k.tree_stat()),
         "Amazon state must never change"
+    );
+}
+
+#[test]
+fn a_failed_mid_rebuild_partial_is_removed_before_the_entry_becomes_unsupported_or_removed() {
+    let mut r = Rig::new();
+    r.k.add_synthetic(ID_A, "Alpha");
+    r.k.add_synthetic(ID_B, "Beta");
+    let good =
+        |r: &Rig, p: &'static Pages| r.with(vec![(ID_A, Ok(decoded(p))), (ID_B, Ok(decoded(p)))]);
+    all_done(&r.run(&good(&r, ONE), &NoSync));
+    r.k.touch(ID_A);
+    r.k.touch(ID_B);
+    let actions = scan(&r.k.sources(), &r.ledger).unwrap().actions;
+    for a in &actions {
+        let boom = Rec::failing_delete_page();
+        let out = r.apply(a, &good(&r, TWO), &boom);
+        assert!(
+            matches!(&out, MirrorOutcome::Failed(m) if m.contains("boom")),
+            "{out:?}"
+        );
+    }
+    let (nb_a, nb_b) = (r.dest(ID_A), r.dest(ID_B));
+    for (id, nb) in [(ID_A, &nb_a), (ID_B, &nb_b)] {
+        assert_eq!(r.entry(id).state, MirrorState::Rebuilding);
+        assert_eq!(r.pages(nb).len(), 5, "partial: two old + three new");
+    }
+
+    // A: the next attempt finds the source permanently undecodable.
+    let actions = scan(&r.k.sources(), &r.ledger).unwrap().actions;
+    let rebuild_a = actions
+        .iter()
+        .find(|a| matches!(a, MirrorAction::Rebuild { source, .. } if source.origin_id == ID_A))
+        .unwrap();
+    let rec = Rec::default();
+    let bad = r.with(vec![(ID_A, Err(NbkError::Unsupported("odd".into())))]);
+    assert!(matches!(
+        r.apply(rebuild_a, &bad, &rec),
+        MirrorOutcome::Failed(_)
+    ));
+    assert!(rec.events().contains(&format!("delete_notebook:{nb_a}")));
+    assert!(!r.live().contains(&nb_a));
+    let a = r.entry(ID_A).clone();
+    assert_eq!(a.state, MirrorState::Unsupported);
+    assert_eq!(a.dest_notebook_id, None);
+
+    // B: the source is deleted on the Kindle.
+    r.k.remove(ID_B);
+    let rec = Rec::default();
+    let out = r.apply(
+        &MirrorAction::Remove {
+            origin_id: ID_B.into(),
+        },
+        &r.with(vec![]),
+        &rec,
+    );
+    assert_eq!(out, MirrorOutcome::Done);
+    assert!(rec.events().contains(&format!("delete_notebook:{nb_b}")));
+    assert!(!r.live().contains(&nb_b));
+    assert!(!r.ledger.data.entries.contains_key(ID_B));
+    assert_eq!(recover_interrupted(&mut r.s.lib, &NoSync), Ok(0));
+}
+
+#[test]
+fn an_unreadable_marker_fails_the_action_and_never_builds_a_second_mirror() {
+    let mut r = Rig::new();
+    r.k.add_synthetic(ID_A, "Alpha");
+    all_done(&r.run(&r.with(vec![(ID_A, Ok(decoded(ONE)))]), &NoSync));
+    let nb = r.dest(ID_A);
+    fs::write(r.s.lib.notebook_dir(&nb).join(MIRROR_MARKER), b"{").unwrap();
+    r.k.touch(ID_A);
+    let before = r.ledger.data.clone();
+    let live = r.live();
+    let out = r.run(&r.with(vec![(ID_A, Ok(decoded(TWO)))]), &NoSync);
+    assert!(
+        matches!(out.as_slice(), [(MirrorAction::Rebuild { .. }, MirrorOutcome::Failed(m))] if m.contains("marker")),
+        "{out:?}"
+    );
+    assert_eq!(r.ledger.data, before, "ledger untouched");
+    assert_eq!(r.live(), live, "no second notebook");
+}
+
+#[test]
+fn rebuild_after_the_user_deleted_the_mirror_builds_exactly_one_new_notebook() {
+    let mut r = Rig::new();
+    r.k.add_synthetic(ID_A, "Alpha");
+    all_done(&r.run(&r.with(vec![(ID_A, Ok(decoded(ONE)))]), &NoSync));
+    let old = r.dest(ID_A);
+    NoSync.delete_notebook(&mut r.s.lib, &old).unwrap();
+    r.k.touch(ID_A);
+    let out = r.run(&r.with(vec![(ID_A, Ok(decoded(TWO)))]), &NoSync);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [(MirrorAction::Rebuild { .. }, MirrorOutcome::Done)]
+        ),
+        "{out:?}"
+    );
+    let nb = r.dest(ID_A);
+    assert_ne!(nb, old);
+    assert_eq!(r.mirrors_of(ID_A), vec![nb.clone()]);
+    assert_eq!(r.content(&nb), expect(&decoded(TWO)));
+    assert_eq!(
+        r.folders.folder_of(&nb),
+        r.ledger.data.amazon_folder.as_deref()
     );
 }

@@ -26,15 +26,11 @@ use crate::library::{
     LibraryRepository, RenameNotebookHooks,
 };
 use crate::nbk_import::{
-    build, convert, discover, write_atomic, GlobalSync, ImportSources, ImportSync, ImportTarget,
-    NoSync, SourceNotebook, STROKES_PER_FSYNC,
+    build, convert, discover, halt, insert_pages_after, write_atomic, write_page_strokes,
+    GlobalSync, ImportSources, ImportSync, ImportTarget, NoSync, SourceNotebook,
 };
-use crate::notebook::{
-    delete_page_durable, insert_page_after_durable, DeletePageHooks, InsertPageHooks,
-    PersistedNotebookManifestV1,
-};
+use crate::notebook::{delete_page_durable, DeletePageHooks, PersistedNotebookManifestV1};
 use crate::runtime::{capture_folder_change, FolderCapture};
-use crate::store::load_existing_page;
 use crate::sync_outbound::DurableWaitError;
 
 // ------------------------------------------------------------------------------ constants
@@ -561,17 +557,6 @@ pub enum MirrorOutcome {
     Halted(String),
 }
 
-/// Error prefixes of a halted step, as in `nbk_import`.
-const SYNC_HALT: &str = "sync halted";
-const CANCELLED: &str = "mirror cancelled";
-
-fn halt(e: DurableWaitError, what: &str) -> String {
-    match e {
-        DurableWaitError::Cancelled => format!("{CANCELLED} (waiting for {what})"),
-        e => format!("{SYNC_HALT} ({what}): {e}"),
-    }
-}
-
 /// Forwards to the caller's sync and remembers whether a flush failed, so any error out of
 /// the engine (including `nbk_import::build`'s) is classified as a halt exactly when sync
 /// stopped.
@@ -632,16 +617,45 @@ pub fn kindle_decode(dir: &Path) -> Result<DecodedNotebook, NbkError> {
 }
 
 /// The entry's notebook, when it is in the library and its marker names this origin. An id
-/// reserved by a create that never happened may since belong to a user notebook; that one is
-/// never touched.
-fn mirror_notebook(library: &LibraryRepository, e: &MirrorEntryV1) -> Option<String> {
-    let dest = e.dest_notebook_id.as_ref()?;
+/// reserved by a create that never happened may since belong to a user notebook (no marker);
+/// that one is never touched. A marker that is present but unreadable is an error, never
+/// "absent": treating it as absent would build a second mirror of the same origin.
+fn mirror_notebook(
+    library: &LibraryRepository,
+    e: &MirrorEntryV1,
+) -> Result<Option<String>, String> {
+    let Some(dest) = e.dest_notebook_id.as_ref() else {
+        return Ok(None);
+    };
     if !library.manifest().notebook_ids.contains(dest) {
-        return None;
+        return Ok(None);
     }
-    let b = fs::read(library.notebook_dir(dest).join(MIRROR_MARKER)).ok()?;
-    let m: MirrorOriginV1 = serde_json::from_slice(&b).ok()?;
-    (m.origin_id == e.origin_id).then(|| dest.clone())
+    let path = library.notebook_dir(dest).join(MIRROR_MARKER);
+    let b = match fs::read(&path) {
+        Ok(b) => b,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read {}: {err}", path.display())),
+    };
+    let m: MirrorOriginV1 = serde_json::from_slice(&b)
+        .map_err(|err| format!("unreadable mirror marker {}: {err}", path.display()))?;
+    Ok((m.origin_id == e.origin_id).then(|| dest.clone()))
+}
+
+/// A `Rebuilding` entry's half-replaced notebook goes (synced delete) before the entry is
+/// rewritten as anything other than `Rebuilding`, so recovery never loses sight of it.
+fn drop_partial(
+    library: &mut LibraryRepository,
+    e: &MirrorEntryV1,
+    sync: &dyn MirrorSync,
+) -> Result<(), String> {
+    if e.state != MirrorState::Rebuilding {
+        return Ok(());
+    }
+    if let Some(dest) = mirror_notebook(library, e)? {
+        sync.delete_notebook(library, &dest)
+            .map_err(|why| format!("remove partial mirror {dest}: {why}"))?;
+    }
+    Ok(())
 }
 
 /// Perform one action. `decode` is injected so tests can hand in a [`DecodedNotebook`]
@@ -700,22 +714,25 @@ fn mirror_content(
         Err(e) => {
             return match classify_decode_error(&e) {
                 DecodeFailure::Transient(why) => Ok(MirrorOutcome::Skipped(why)),
-                DecodeFailure::Permanent(why) => unsupported(ledger, prev, source, stamp, why),
+                DecodeFailure::Permanent(why) => {
+                    unsupported(t, ledger, prev, source, stamp, why, sync)
+                }
             }
         }
     };
     let pages = match convert(&decoded) {
         Ok((p, _)) if p.is_empty() => {
             let why = "NBK_UNSUPPORTED: notebook has no pages".to_string();
-            return unsupported(ledger, prev, source, stamp, why);
+            return unsupported(t, ledger, prev, source, stamp, why, sync);
         }
         Ok((p, _)) => p,
-        Err(why) => return unsupported(ledger, prev, source, stamp, why),
+        Err(why) => return unsupported(t, ledger, prev, source, stamp, why, sync),
     };
     let hash = content_hash(&decoded);
-    let live = prev
-        .as_ref()
-        .and_then(|e| mirror_notebook(t.import.library, e));
+    let live = match &prev {
+        Some(e) => mirror_notebook(t.import.library, e)?,
+        None => None,
+    };
 
     if let (Some(dest), Some(p)) = (&live, &prev) {
         if p.content_sha256.as_deref() == Some(hash.as_str()) {
@@ -784,31 +801,9 @@ fn replace_pages(
     let nb_dir = lib.notebook_dir(dest);
     let mut manifest = read_notebook_manifest_read_only(&nb_dir)?;
     let old = manifest.page_ids.clone();
-    let mut fresh = Vec::with_capacity(pages.len());
-    for _ in pages {
-        let after = manifest
-            .page_ids
-            .last()
-            .cloned()
-            .ok_or("notebook has no page")?;
-        let commit =
-            insert_page_after_durable(&nb_dir, &mut manifest, &after, &InsertPageHooks::default())?;
-        sync.page_created(&nb_dir, dest, &commit.inserted_page_id, &after);
-        sync.flush(cancel).map_err(|e| halt(e, "page create"))?;
-        fresh.push(commit.inserted_page_id);
-    }
-    lib.set_cached_page_count(dest, manifest.page_ids.len());
+    let fresh = insert_pages_after(lib, dest, &mut manifest, pages.len(), cancel, sync)?;
     for (page_id, strokes) in fresh.iter().zip(pages) {
-        if strokes.is_empty() {
-            continue;
-        }
-        let (mut store, _) = load_existing_page(&nb_dir, page_id)?;
-        for chunk in strokes.chunks(STROKES_PER_FSYNC) {
-            store.append_committed_strokes(chunk)?;
-            sync.strokes_committed(dest, page_id, chunk);
-            // Backpressure: this batch's captures are durable before the next is written.
-            sync.flush(cancel).map_err(|e| halt(e, "strokes"))?;
-        }
+        write_page_strokes(&nb_dir, dest, page_id, strokes, cancel, sync)?;
     }
     for page_id in &old {
         let r = sync.delete_page(&nb_dir, &mut manifest, dest, page_id);
@@ -869,14 +864,28 @@ fn finish(
 }
 
 /// A source that will not decode as-is: remember its stamp and why (so it is not retried
-/// until it changes); any existing mirror notebook is kept as it is.
+/// until it changes); a complete mirror notebook is kept as it is, a half-rebuilt one removed.
 fn unsupported(
+    t: &mut MirrorTarget<'_>,
     ledger: &mut MirrorLedger,
     prev: Option<MirrorEntryV1>,
     source: &SourceNotebook,
     stamp: SourceStamp,
     why: String,
+    sync: &dyn MirrorSync,
 ) -> Result<MirrorOutcome, String> {
+    let prev = match prev {
+        Some(p) if p.state == MirrorState::Rebuilding => {
+            drop_partial(t.import.library, &p, sync)?;
+            Some(MirrorEntryV1 {
+                dest_notebook_id: None,
+                content_sha256: None,
+                pages: 0,
+                ..p
+            })
+        }
+        p => p,
+    };
     let base = prev.unwrap_or_else(|| MirrorEntryV1 {
         origin_id: source.origin_id.clone(),
         title: source.title.clone(),
@@ -907,7 +916,7 @@ fn rename(
     let Some(mut e) = ledger.data.entries.get(&source.origin_id).cloned() else {
         return Err(format!("no mirror entry for {}", source.origin_id));
     };
-    if let Some(dest) = mirror_notebook(t.import.library, &e) {
+    if let Some(dest) = mirror_notebook(t.import.library, &e)? {
         if t.import.library.title(&dest).ok() != Some(source.title.as_str()) {
             sync.rename_notebook(t.import.library, &dest, &source.title)?;
             sync.flush(t.import.cancel).map_err(|e| halt(e, "rename"))?;
@@ -920,7 +929,8 @@ fn rename(
 }
 
 /// The source is gone: its mirror moves to the Removed folder (never deleted); an entry that
-/// never built anything is forgotten.
+/// never built anything, or whose rebuild was left half-done (that partial is removed), is
+/// forgotten.
 fn remove(
     t: &mut MirrorTarget<'_>,
     ledger: &mut MirrorLedger,
@@ -930,11 +940,16 @@ fn remove(
     let Some(mut e) = ledger.data.entries.get(origin_id).cloned() else {
         return Ok(MirrorOutcome::Done);
     };
+    if e.state == MirrorState::Rebuilding {
+        drop_partial(t.import.library, &e, sync)?;
+        ledger.remove(origin_id)?;
+        return Ok(MirrorOutcome::Done);
+    }
     if e.dest_notebook_id.is_none() {
         ledger.remove(origin_id)?;
         return Ok(MirrorOutcome::Done);
     }
-    if let Some(dest) = mirror_notebook(t.import.library, &e) {
+    if let Some(dest) = mirror_notebook(t.import.library, &e)? {
         file_into(t, ledger, &dest, Which::Removed, sync)?;
         sync.flush(t.import.cancel).map_err(|e| halt(e, "remove"))?;
     }
@@ -962,11 +977,10 @@ pub(crate) fn recover_interrupted(
     let mut recovered = 0;
     let mut errors = Vec::new();
     for e in stuck {
-        if let Some(dest) = mirror_notebook(library, &e) {
-            if let Err(why) = sync.delete_notebook(library, &dest) {
-                errors.push(format!("{} ({dest}): {why}", e.origin_id));
-                continue;
-            }
+        // An unreadable marker is reported and the entry kept (retried next start).
+        if let Err(why) = drop_partial(library, &e, sync) {
+            errors.push(format!("{}: {why}", e.origin_id));
+            continue;
         }
         match ledger.remove(&e.origin_id) {
             Ok(()) => recovered += 1,
