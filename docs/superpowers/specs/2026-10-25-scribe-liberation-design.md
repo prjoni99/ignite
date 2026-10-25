@@ -20,7 +20,7 @@ no cloud dependency required for any feature, no subscriptions.
 
 ## The four pieces, in build order
 
-1. **Amazon mirror library**: continuous one-way export of stock Scribe notebooks into a read-only Ignite library.
+1. **Amazon mirror**: continuous one-way export of stock Scribe notebooks into a read-only `Amazon` folder of the device's library.
 2. **Vault**: Ignite Server materializes every library as a folder of SVG, PNG, PDF, JSON and Markdown files, atomically, on every change.
 3. **Print to Scribe**: a server inbox folder and web upload turn a PDF into an annotatable Ignite notebook that syncs to the Kindle.
 4. **Live ink**: an opt-in mode that streams strokes to the server as they are written, rendered in the browser within a few hundred milliseconds.
@@ -58,47 +58,67 @@ that 3's annotated output is more useful once 2 exists.
 - Imports run only at idle safe points, never on the pen path. The mirror obeys the same rule.
 - Sync is versioned `SyncOperationV1` envelopes over `/v1` on `scribe-sync-server`; pages carry a `BackgroundRef` that is `Blank` or a content-addressed `Blob` uploaded via `PUT /v1/blobs/{sha256}`. Print to Scribe uses exactly these.
 - Server-side acceptance of destructive lineage replacement is off by default; nothing here needs it on.
-- Panel geometry is 1860 x 2480 (`kindle-platform::gate_b`); backgrounds are rasterized at that size.
+- Panel geometry is 1860 x 2480 (`FbGeometry` at runtime; the `--diagnose-fb` Gate B check in `scribe-app`). The Kindle **refuses** inbound blob backgrounds whose dimensions differ from the panel (`sync_materialize.rs`), so rasterizing at exactly that size is mandatory.
+- A Kindle runtime has exactly **one** library (one `--data-dir`, one `sync-state.json`, one `library_id`). Libraries have no name anywhere in the protocol; the control plane names devices.
+- There is no shared Rust rasterizer: the Kindle rasterizes in `scribe-app` (`render.rs`, `profile.rs`, `pressure_curve.rs`), the browser in TypeScript (`ignite/web/src/rendering/brush.ts`), pinned to the Rust-generated `brush-v1.json` fixture. `scribe-web-wasm` does encoding and erase projection, not pixels.
+- `POST /v1/.../operations` caps a batch at 100 envelopes, and a notebook must always have at least one page.
+- `scribe-sync-server` today never authors notebook content of its own; Print to Scribe changes that (see piece 3).
 - `scribe-server` already has an in-process exporter pattern (`export.rs`) that reads the server's own `/v1` GET router with no HTTP and no credential. The vault writer reuses that pattern.
 - On-disk server paths stay `/etc/scribe-server` and `/var/lib/scribe-server`.
 
 ---
 
-## 1. Amazon mirror library
+## 1. Amazon mirror
 
 ### What it is
 
-A library named `Amazon` (fixed internal id, display name localizable) that
-holds a read-only copy of every stock Scribe notebook, kept current by
-re-snapshotting whenever a source changes. It replaces the one-shot "Import
+A reserved folder named `Amazon` in the device's single library, created with
+the existing `CreateFolder` / `SetNotebookFolder` operations, that holds a
+read-only copy of every stock Scribe notebook, kept current by re-snapshotting
+whenever a source changes. (Author's call after review: a second library would
+mean a second repository, sync dir, outbox and server bootstrap, most of a
+project for no visible gain; a folder gives the same experience.) It replaces the one-shot "Import
 all" as the default relationship with Amazon notebooks. "Import all" stays as
 the way to get an editable Ignite copy.
 
 ### Decided
 
-- **Separate library, not in-place re-import.** The existing copy-once receipts
+- **Separate notebooks in a reserved folder, not in-place re-import.** The existing copy-once receipts
   stay as they are. Mirror state lives in its own ledger
-  (`<library>/.scribe-mirror/ledger.json`) keyed `amazon_nbk:<uuid>`, recording
+  (`<data-dir>/.scribe-mirror/ledger.json`, beside the existing `.scribe-import/`) keyed `amazon_nbk:<uuid>`, recording
   the source stamp (size + mtime of `nbk` and `actions.log`) and the content
   hash of the last decoded snapshot.
-- **Read-only in Ignite UI.** Mirror notebooks open for viewing and for "Copy
-  to Ignite" (which is the existing import path targeting a chosen library).
-  Pen input on a mirror page is refused with a one-line hint.
+- **Read-only by convention, no protocol change.** On the Kindle each mirror
+  notebook carries an immutable `mirror-origin.json` marker (like
+  `import-origin.json`); pen input on a mirror page is refused with a one-line
+  hint, and "Copy to Ignite" runs the existing import path to make an editable
+  copy outside the folder. The browser companion treats any notebook inside a
+  folder named `Amazon` as read-only (view only, banner explaining why).
+  Author's call: a protocol-level attribute would change canonical bytes and
+  need a version bump; the convention is enough for v1 and can be hardened
+  later.
 - **Replace wholesale per notebook.** When a source's decoded content hash
   changes, the mirror notebook is rebuilt: new pages and strokes emitted as
-  ordinary sync operations (delete old pages, create new pages, add strokes),
-  so the server and browser replica see it as a normal notebook. Rename follows
-  the catalog title. A source that disappears from the catalog moves its
-  mirror notebook to a `Removed from Amazon` folder inside the library rather
-  than deleting it.
-- **Cadence.** Rescan at app launch, after each successful sync upload cycle,
-  and on an idle timer (default 15 minutes while the app is foreground and
-  idle). A rescan is cheap (stat the catalog and each source directory);
-  decoding happens only for changed stamps.
+  ordinary sync operations in the order create new pages, add strokes, then
+  delete the old pages (a notebook must always keep at least one page), in
+  batches of at most 100 envelopes with the same journal backpressure as
+  `nbk_import`. The server and browser replica see a normal notebook. Rename
+  follows the catalog title. A source that disappears from the catalog moves
+  its mirror notebook to a `Removed from Amazon` folder rather than deleting
+  it.
+- **Cadence and where it runs.** A *scan* (stat the catalog and each source
+  directory) runs at app launch, after each successful sync upload cycle, and
+  on an idle timer (default 15 minutes). A *rebuild* (decode + emit ops) runs
+  only at the existing idle safe point and only while no page is open (Home or
+  Tools view), so it can never stall the pen path; a pending rebuild waits for
+  the user to leave the page. No new background thread. Author's call: this is
+  the smallest change that keeps the anti-goal.
 - **Skipped sources are retried, not failed.** `PendingActions`, `SourceBusy`
   and `SourceChanged` leave the ledger untouched so the next rescan tries again.
-  `Unsupported` and `Container` errors are recorded with the stamp so they are
-  not re-attempted until the source changes; they show in the Tools view.
+  `Unsupported` and `Container` errors are recorded with the stamp and reason
+  in the mirror ledger so they are not re-attempted until the source changes.
+  The Tools view gains a per-source status list (new work: today only the
+  current run's failures are shown, nothing is persisted).
 - **Opt-in toggle** in Tools, default on once the user has enabled sync; off
   when sync is off (a mirror that never leaves the device is just a slower
   copy).
@@ -127,7 +147,7 @@ equal to the current state of every library, as plain files.
 
 ```
 vault/
-  <library display name> [<short id>]/
+  <library name>/                 (see Naming)
     <notebook title> [<short id>]/
       page-001.svg
       page-001.png
@@ -148,7 +168,12 @@ vault/
 - **Atomic per notebook.** The writer renders into a sibling temp directory
   and renames it over the notebook folder (on the same filesystem). A watcher
   never sees a partial page set.
-- **Naming.** Titles are sanitized to a safe cross-platform subset (no path
+- **Library naming.** Libraries have no name in the protocol. The server
+  config gains `[vault.names]`, a map from library id to folder name, editable
+  from the browser companion's server settings (stored server-side through the
+  control plane). Unnamed libraries use `library-<short id>`. Author's call;
+  a protocol-level library name is not worth a version bump.
+- **Notebook naming.** Titles are sanitized to a safe cross-platform subset (no path
   separators, control characters, reserved Windows names, trailing dots or
   spaces; length capped). The short id suffix (first 8 chars of the notebook
   id) makes names unique and stable across renames; a rename renames the
@@ -159,8 +184,18 @@ vault/
   - `page-NNN.svg`: strokes as `<path>` elements with per-segment widths from
     the render profile's pressure curve, viewBox 1860 x 2480, background
     referenced as an embedded PNG when the page has a blob background.
-  - `page-NNN.png`: 8-bit grayscale raster at panel resolution, rendered by the
-    same rasterizer the browser bridge uses (shared Rust code, not a browser).
+  - `page-NNN.png`: 8-bit grayscale raster at panel resolution. There is no
+    shared rasterizer today; `notebook-render` is a third implementation of
+    the brush, pinned to the same `brush-v1.json` fixture the browser uses,
+    with the browser's contract: logical stroke widths equal, antialiasing may
+    differ. The Kindle rasterizer is **not** moved (pen-path code, hardware
+    re-qualification). Author's call.
+  - Positioned text (`SyncText`) is rendered in SVG, PNG and PDF using the
+    fonts already bundled under `ignite/assets/` (SIL OFL), matching the
+    browser's layout for the `default-sans-v1` face. Page links
+    (`SyncPageLink`) are emitted as `<a>` elements in SVG and omitted from PNG
+    and PDF in v1. Author's call: dropping typed annotations from
+    `notebook.pdf` would silently lose content.
   - `notebook.pdf`: one page per notebook page, vector strokes over the
     background image.
   - `strokes.json`: the canonical `SyncSnapshotV1` subset for this notebook
@@ -169,8 +204,8 @@ vault/
     one `## Page N` section per page with an image link to the PNG and, when a
     recognizer has run, the recognized text.
 - **Rendering lives in a new crate** `ignite/core/notebook-render` (SVG, PNG,
-  PDF from `SyncSnapshotV1` + blobs). The WASM bridge may adopt it later;
-  that is not part of this work.
+  PDF from `SyncSnapshotV1` + blobs). It may later replace the TypeScript
+  brush via the WASM bridge; that is not part of this work.
 - **Trigger.** The writer runs in `scribe-server` after each accepted `/v1`
   envelope batch, debounced (default 2 s) per notebook, plus the admin rebuild.
 - **Recognizer hook.** Config key `recognizer_command` in
@@ -187,8 +222,8 @@ vault/
 
 - PDF library choice (pure-Rust preferred; no system dependency on the Linux
   bundle or the GHCR image).
-- Whether the Amazon mirror library's vault folder gets a `source: amazon`
-  marker in `notebook.md` front matter. Recommended yes, cheap.
+- Whether notebooks under the `Amazon` folder get a `source: amazon` line in
+  `notebook.md` front matter. Recommended yes, cheap.
 - Exact debounce and bounded-size numbers.
 
 ### Done looks like
@@ -212,16 +247,27 @@ PDF's pages as backgrounds, and it syncs to the Kindle like any notebook.
 - **Input: PDF only** in v1. Other types are left in place and listed as
   "unsupported" in the inbox status. Web pages come later via print-to-PDF.
 - **Target library** is chosen per upload in the browser; the inbox folder
-  uses a configured default library and supports one subfolder level named
-  after a library to override it (`inbox/<library name>/x.pdf`).
-- **Rasterization** to 8-bit grayscale at 1860 x 2480, fit-to-page with
-  letterboxing, one background blob per page, uploaded via the existing blob
+  uses `inbox.default_library` from server config and supports one subfolder
+  level named after a vault library name or id to override it
+  (`inbox/<library name>/x.pdf`).
+- **The server becomes an authoring replica.** This is a principle change:
+  `scribe-sync-server` has never written notebook content of its own. It gets
+  a durable `ReplicaId` and a persisted, strictly increasing `client_seq`,
+  stored inside the ledger store so a backup/restore of the server carries it.
+  Portable backups contain no replica identities, so restoring one into a new
+  server mints a fresh replica at genesis; the old server's sequence state is
+  simply not reused. All inbox operations go through `Store::submit` like any
+  replica's, in-process via `http::route`. Author's call on the mechanics; the
+  principle change follows directly from the owner asking for Print to Scribe.
+- **Rasterization** to 8-bit grayscale at exactly 1860 x 2480 (the Kindle
+  refuses other sizes), fit-to-page with letterboxing, one background blob per page, uploaded via the existing blob
   endpoint and referenced as `BackgroundRef::Blob`. Page count is capped
   (default 200); larger PDFs are refused with a clear status.
 - **Notebook title** is the PDF filename without extension, sanitized the same
   way as vault names. The first page uses `CreateNotebook`, the rest
-  `CreatePage`, all through the server's normal `/v1` path in-process, so the
-  Kindle and browser see ordinary operations.
+  `CreatePage`, in batches of at most 100 envelopes, all through the server's
+  normal `/v1` path in-process, so the Kindle and browser see ordinary
+  operations.
 - **Inbox lifecycle.** A processed file moves to `inbox/.done/`, a refused one
   to `inbox/.failed/` with a sibling `.txt` reason. Files are only picked up
   once their size has been stable for a few seconds (partial copies).
@@ -300,15 +346,17 @@ returns to normal with no code on the pen path.
   installer. Each piece is a separate release train entry.
 - **Testing.** Mirror: fixture notebooks under the existing
   `nbk-import-samples` feature, plus a never-writes assertion on the source
-  tree. Vault: golden files for SVG and Markdown, PNG compared pixelwise to the
-  shared rasterizer, atomicity tested by interrupting a write. Print: round
+  tree and a never-rebuilds-with-a-page-open test. Vault: golden files for SVG
+  and Markdown, PNG checked against the `brush-v1.json` fixture (logical
+  widths, not pixel identity), atomicity tested by interrupting a write. Print: round
   trip a generated PDF. Live: queue-bound and off-path tests on the Kindle
   side; SSE ordering in the server.
 - **Docs.** `docs/self-hosting.md` gains Vault, Inbox and Recognizer sections;
   `docs/architecture.md` gains the new crate and routes.
 
-## Open questions for the owner
+## Review log
 
-None at draft time. Items marked "left to the builder" are the builder's
-calls; items under "Decided" are the owner's unless marked as the author's
-default.
+2026-10-25: builder check (fresh reviewer, read the doc and the codebase).
+Seven questions and five factual corrections, all resolved in this revision
+and marked "Author's call" where the author settled them. No open questions
+for the owner.
