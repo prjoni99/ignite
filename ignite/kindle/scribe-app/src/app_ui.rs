@@ -880,13 +880,13 @@ impl UiState {
                 Modal::TemplatePicker {
                     purpose,
                     mut options,
-                    unreadable,
                     ..
                 },
                 ButtonId::PickTemplate(k),
-            ) if k < options.len() && !unreadable.contains(&k) => {
+            ) if k < options.len() => {
+                // Disabled (unreadable) options never hit; the runtime records the last used
+                // template once the create/insert succeeds.
                 let template = options.swap_remove(k).0;
-                self.template = template.clone();
                 match purpose {
                     PickerPurpose::NewNotebook { title, folder_id } => {
                         UiCommand::CreateNotebookWithTemplate {
@@ -1418,7 +1418,7 @@ mod tests {
             vec![
                 ("Planner".to_string(), true),
                 ("broken".to_string(), false),
-                ("grid-big \u{2713}".to_string(), true),
+                ("grid-big *".to_string(), true),
                 ("PREVIOUS".to_string(), true),
                 ("NEXT".to_string(), false),
                 ("CANCEL".to_string(), true),
@@ -1431,13 +1431,15 @@ mod tests {
         };
         ui.open_template_picker(new_main, template_entries());
         let labels = picker_labels(&ui);
-        assert_eq!(labels[0], ("Blank \u{2713}".to_string(), true));
+        assert_eq!(labels[0], ("Blank *".to_string(), true));
         assert_eq!(labels[1], ("Lined".to_string(), true));
         assert_eq!(labels.len(), 8);
     }
 
+    /// The picker only emits the command; remembering the template is the runtime's job
+    /// (`remember_template` after a successful create/insert; persistence is covered in prefs).
     #[test]
-    fn pick_template_creates_with_that_template_and_remembers_it() {
+    fn pick_template_emits_create_with_that_template_and_leaves_remembering_to_the_runtime() {
         use crate::templates::TemplateId;
         let g = crate::ui_gfx::panel_geo();
         let mut ui = UiState::launch_home(0, 2);
@@ -1473,11 +1475,12 @@ mod tests {
             }
         );
         assert!(ui.modal.is_none());
-        assert_eq!(ui.template, lined);
+        assert_eq!(ui.template, TemplateId::default());
 
-        // Reopening preselects it.
+        // Once the runtime records it, reopening preselects it.
+        ui.template = lined.clone();
         ui.open_template_picker(purpose, template_entries());
-        assert_eq!(picker_labels(&ui)[1], ("Lined \u{2713}".to_string(), true));
+        assert_eq!(picker_labels(&ui)[1], ("Lined *".to_string(), true));
 
         // CANCEL discards the title and creates nothing.
         assert_eq!(
@@ -1495,7 +1498,7 @@ mod tests {
             UiCommand::InsertPageWithTemplate(grid.clone())
         );
         assert!(ui.modal.is_none());
-        assert_eq!(ui.template, grid);
+        assert_eq!(ui.template, lined);
     }
 
     #[test]

@@ -46,7 +46,7 @@ pub enum TitlePurpose {
 pub const PICKER_PAGE: usize = 5;
 
 /// Suffix marking the preselected (last used) template in the picker.
-pub const TEMPLATE_SELECTED_MARK: &str = " \u{2713}";
+pub const TEMPLATE_SELECTED_MARK: &str = " *";
 
 /// What the template picker's choice is for.
 #[derive(Clone, Debug, PartialEq, Eq)]

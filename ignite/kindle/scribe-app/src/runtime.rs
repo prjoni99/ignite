@@ -1277,7 +1277,7 @@ fn navigate(
     let repair_strokes = ctrl.session.committed_strokes().to_vec();
 
     let (new_store, loaded, created_now) = if creating {
-        match create_page_files_from_template(data_dir, &target_id, DEFAULT_PAGE_ID) {
+        match create_page_files_from_template(data_dir, &target_id, DEFAULT_PAGE_ID, None) {
             Ok(v) => (v.0, v.1, true),
             Err(e) => {
                 ctrl.totals.page_switch_failures += 1;

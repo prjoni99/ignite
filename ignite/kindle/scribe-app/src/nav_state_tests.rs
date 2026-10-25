@@ -316,7 +316,7 @@ fn page_create_insert_delete_and_reorder_keep_the_shown_page() {
     navigate(&e.lib, NB, &mut m, "page-1");
     let new_id = allocate_page_id(&m);
     let last = m.page_ids.last().unwrap().clone();
-    create_page_files_from_template(&d, &new_id, &last).unwrap();
+    create_page_files_from_template(&d, &new_id, &last, None).unwrap();
     commit_new_page_to_manifest(&d, &mut m, &new_id).unwrap();
     assert_eq!(reopened_page(&e.lib, NB), new_id);
     cleanup(e);
