@@ -883,6 +883,7 @@ dependencies = [
  "scribe-sync-server",
  "serde",
  "serde_json",
+ "sha2",
  "sync-engine",
  "sync-protocol",
  "ureq",

@@ -285,3 +285,66 @@ fn rebuilding_and_stampless_unsupported_sources_that_are_present_rebuild() {
             if a.origin_id == ID_A && b.origin_id == ID_B
     ));
 }
+
+fn stroke(xs: &[i64], ys: &[i64]) -> nbk_reader::DecodedStroke {
+    nbk_reader::DecodedStroke {
+        xs: xs.to_vec(),
+        ys: ys.to_vec(),
+        pressure: Some(vec![5; xs.len()]),
+        brush_type: Some(1),
+        color: Some(0),
+        thickness: Some(1.5),
+        diagnostics: vec![],
+    }
+}
+
+fn decoded(strokes: Vec<nbk_reader::DecodedStroke>) -> nbk_reader::DecodedNotebook {
+    nbk_reader::DecodedNotebook {
+        pages: vec![nbk_reader::DecodedPage {
+            page_id: "p1".into(),
+            missing: false,
+            width: 1000,
+            height: 2000,
+            normalized_ppi: Default::default(),
+            template_id: None,
+            field_fallbacks: vec![],
+            strokes,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn content_hash_is_stable_and_ignores_diagnostics_and_book_id() {
+    let a = decoded(vec![stroke(&[1, 2, 3], &[4, 5, 6])]);
+    let mut b = a.clone();
+    b.book_id = Some("book".into());
+    b.diagnostics.delta_count = 9;
+    b.template_ids = vec!["t".into()];
+    b.pages[0].strokes[0].diagnostics = vec!["note".into()];
+    let h = content_hash(&a);
+    assert_eq!(h.len(), 64);
+    assert!(h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    assert_eq!(h, content_hash(&a));
+    assert_eq!(h, content_hash(&b));
+
+    let moved = decoded(vec![stroke(&[1, 2, 4], &[4, 5, 6])]);
+    assert_ne!(h, content_hash(&moved));
+    // Boundary shift between xs and ys must not collide.
+    assert_ne!(
+        content_hash(&decoded(vec![stroke(&[1, 2], &[3, 4, 5])])),
+        content_hash(&decoded(vec![stroke(&[1, 2, 3], &[4, 5])]))
+    );
+}
+
+#[test]
+fn decode_errors_split_into_transient_and_permanent() {
+    use nbk_reader::NbkError;
+    assert!(matches!(classify_decode_error(&NbkError::PendingActions { nbk_strokes: 1, action_stroke_inserts: 2 }), DecodeFailure::Transient(_)));
+    for e in [NbkError::Io("x".into()), NbkError::SourceBusy("x".into()), NbkError::SourceChanged("x".into())] {
+        assert!(matches!(classify_decode_error(&e), DecodeFailure::Transient(_)));
+    }
+    for e in [NbkError::Container("x".into()), NbkError::Unsupported("x".into())] {
+        assert!(matches!(classify_decode_error(&e), DecodeFailure::Permanent(_)));
+    }
+}

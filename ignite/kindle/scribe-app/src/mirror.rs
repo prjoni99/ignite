@@ -299,6 +299,75 @@ pub fn scan(src: &ImportSources, ledger: &MirrorLedger) -> Result<MirrorScan, St
     Ok(out)
 }
 
+/// How a failed decode should be treated by the rebuild engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodeFailure {
+    /// Retry on a later scan; the source may become readable.
+    Transient(String),
+    /// The source will not decode as-is; do not retry until it changes.
+    Permanent(String),
+}
+
+pub fn classify_decode_error(e: &nbk_reader::NbkError) -> DecodeFailure {
+    use nbk_reader::NbkError::*;
+    match e {
+        Io(_) | SourceBusy(_) | SourceChanged(_) | PendingActions { .. } => {
+            DecodeFailure::Transient(e.to_string())
+        }
+        Container(_) | Unsupported(_) => DecodeFailure::Permanent(e.to_string()),
+    }
+}
+
+fn put_len(h: &mut sha2::Sha256, n: usize) {
+    use sha2::Digest;
+    h.update((n as u64).to_le_bytes());
+}
+
+fn put_i64s(h: &mut sha2::Sha256, v: &[i64]) {
+    use sha2::Digest;
+    put_len(h, v.len());
+    for x in v {
+        h.update(x.to_le_bytes());
+    }
+}
+
+/// Deterministic lowercase-hex SHA-256 over the drawn content of a decoded notebook.
+/// Diagnostics, fallbacks, template ids and `book_id` do not affect it.
+pub fn content_hash(nb: &nbk_reader::DecodedNotebook) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    put_len(&mut h, nb.pages.len());
+    for p in &nb.pages {
+        put_len(&mut h, p.page_id.len());
+        h.update(p.page_id.as_bytes());
+        h.update(p.width.to_le_bytes());
+        h.update(p.height.to_le_bytes());
+        put_len(&mut h, p.strokes.len());
+        for s in &p.strokes {
+            put_i64s(&mut h, &s.xs);
+            put_i64s(&mut h, &s.ys);
+            put_i64s(&mut h, s.pressure.as_deref().unwrap_or(&[]));
+            for opt in [s.brush_type, s.color] {
+                match opt {
+                    Some(v) => {
+                        h.update([1u8]);
+                        h.update(v.to_le_bytes());
+                    }
+                    None => h.update([0u8]),
+                }
+            }
+            match s.thickness {
+                Some(t) => {
+                    h.update([1u8]);
+                    h.update(t.to_bits().to_le_bytes());
+                }
+                None => h.update([0u8]),
+            }
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 #[path = "mirror_tests.rs"]
 mod tests;
