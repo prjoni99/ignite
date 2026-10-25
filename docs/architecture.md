@@ -41,6 +41,44 @@ Shared types and reducers live in:
 - `sync-protocol` — canonical envelopes and hashing
 - `sync-engine` — apply / reduce / testkit fixtures
 
+### Amazon mirror
+
+`scribe-app`'s `mirror` module continuously mirrors stock Kindle notebooks,
+read-only, into the Ignite library so they reach the sync server and the
+browser companion.
+
+- Source: `/mnt/us/.notebooks/<uuid>/` plus the catalog
+  `/var/local/ksdk.content.db`, read-only; nothing there is written, locked or
+  renamed. Identity is the catalog UUID.
+- Mirrors live in the device's single library, in a folder titled `Amazon`;
+  each carries an immutable `mirror-origin.json` marker in its notebook
+  directory. A source deleted on the Kindle moves its mirror to `Removed from
+  Amazon` (never deleted); if it reappears it is rebuilt and filed under
+  `Amazon`. Either folder may be renamed; the folder id is what matters.
+- Ledger: `<data-dir>/.scribe-mirror/ledger.json` (beside `.scribe-import/`),
+  one entry per source UUID: state `current`, `rebuilding`, `removed` or
+  `unsupported`, source stamp (size + mtime of `nbk` and `actions.log`) and
+  content hash. A corrupt ledger fails closed: the mirror pauses and nothing
+  is created or removed.
+- Cadence: a stat-only scan runs at launch, after each completed sync upload
+  batch and every 15 minutes. A rebuild (decode + ordinary sync operations)
+  runs one notebook per loop iteration. Both run only at the safe point: Home
+  or Tools showing, pen idle, no page open. Never while sync is off or unlinked.
+- Rebuild order: new pages and strokes first, old pages deleted after, so a
+  notebook never drops below one page. Strokes flush to the journal in batches
+  (same backpressure as "Import Kindle notebooks"). A crash mid-rebuild is
+  cleaned up at next launch (partial mirror removed via the synced delete path,
+  recreated by the next scan); never more than one mirror per source.
+- Read-only: on the Kindle, pen/eraser, undo, page add/move/delete, link
+  add/remove, lasso moves and rename are refused with a hint pointing to Copy
+  to Ignite. In the browser companion, a notebook in a folder titled exactly
+  `Amazon` shows a read-only banner and offers no Write/Type tools; moving it
+  out lifts the convention (the next rebuild files it back).
+- Copy to Ignite: the Home card menu runs the existing one-way import to make
+  an editable copy; a source is copied at most once.
+- Setting: Preferences → `AMAZON MIRROR` (`mirror_amazon` in replica-local
+  `preferences.json`, default on). Tools shows status and `RESCAN NOW`.
+
 ## Sync and operation envelopes
 
 Outbound/inbound sync uses versioned operation envelopes. A self-hosted

@@ -102,3 +102,28 @@ Ordinary handwriting does not require a server. If you enable self-hosted sync:
   threat model
 - Do not enable experimental server lineage-replacement acceptance unless you
   are following a controlled recovery procedure (not part of normal install)
+
+## Amazon mirror (optional)
+
+Stock Kindle notebooks are mirrored read-only into the `Amazon` folder when
+sync is linked. See `docs/architecture.md`.
+
+**Notebook not appearing under Amazon.** Check in order:
+
+1. Sync is linked (Sync view); the mirror never runs while sync is off.
+2. Preferences → `AMAZON MIRROR` → `Mirror Amazon notebooks` is On.
+3. The Kindle has finished saving the notebook; a source still being written or
+   with pending actions is retried at the next scan.
+4. Tools → MIRROR block: an entry under unsupported sources means the notebook
+   could not be read or is unsupported; it is not retried until it changes.
+5. Press `RESCAN NOW` in Tools.
+
+**Nothing happens while writing.** Expected: scans and rebuilds run only on
+Home or Tools with the pen idle, never with a page open.
+
+**Removed from Amazon.** The source was deleted on the Kindle; its mirror is
+kept there, never deleted. It returns to `Amazon` if the source reappears. A
+mirror you deleted in Ignite is recreated at the source's next change.
+
+**Log lines.** `mirror_scan`, `mirror_step` and `mirror_recovered` appear in
+the app log.
