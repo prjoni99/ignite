@@ -359,6 +359,7 @@ fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
         last_batches: 3,
         recovery_done: false,
         last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(apply_mirror_toggle(false, &mut run, &mut clock));
     assert!(run.is_none());
@@ -1510,6 +1511,7 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
         last_batches: 0,
         recovery_done: false,
         last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(scan_due(&launch, t0, 0));
     let after = MirrorClock {
@@ -1517,6 +1519,7 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
         last_batches: 3,
         recovery_done: false,
         last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(!scan_due(&after, t0, 3));
     assert!(!scan_due(&after, t0 + Duration::from_secs(60), 3));
@@ -1642,6 +1645,7 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
     );
     let ledger = MirrorLedger {
         path: PathBuf::new(),
+        scan_persisted_ms: None,
         data,
     };
     let live = MirrorLive {
@@ -1649,6 +1653,8 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
         sync_linked: true,
         queued: 2,
         skipped: 1,
+        // Older than the ledger's copy: the later one shows.
+        last_scan_unix_ms: Some(500),
     };
     let s = summary(&ledger, live, 181_000);
     assert_eq!(
@@ -1668,6 +1674,7 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
     );
     let empty = MirrorLedger {
         path: PathBuf::new(),
+        scan_persisted_ms: None,
         data: MirrorLedgerV1::default(),
     };
     assert_eq!(
@@ -1676,5 +1683,59 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
             now_unix_ms: 5,
             ..MirrorSummary::default()
         }
+    );
+    // The runtime's exact time wins when the ledger's copy was throttled.
+    let live = MirrorLive {
+        last_scan_unix_ms: Some(4),
+        ..MirrorLive::default()
+    };
+    assert_eq!(summary(&empty, live, 5).last_scan_unix_ms, Some(4));
+}
+
+#[test]
+fn note_scan_writes_only_on_an_error_change_or_every_fifteen_minutes() {
+    let s = Scribe::new();
+    let on_disk = || MirrorLedger::open(s.lib.root()).unwrap().data;
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let step = SCAN_NOTE_INTERVAL.as_millis() as u64;
+    let t0 = 1_000_000;
+    // First scan ever: written.
+    assert_eq!(l.note_scan_at(t0, None), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0));
+    // Same outcome a minute later: memory exact, disk untouched.
+    assert_eq!(l.note_scan_at(t0 + 60_000, None), Ok(false));
+    assert_eq!(l.data.last_scan_unix_ms, Some(t0 + 60_000));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0));
+    // An error appears: written at once.
+    let err = Some("Kindle catalog: locked".to_string());
+    assert_eq!(l.note_scan_at(t0 + 120_000, err.clone()), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000));
+    assert_eq!(on_disk().last_scan_error, err);
+    // The same error again: not written until the interval elapsed since the last write.
+    assert_eq!(l.note_scan_at(t0 + 180_000, err.clone()), Ok(false));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000));
+    assert_eq!(
+        l.note_scan_at(t0 + 120_000 + step - 1, err.clone()),
+        Ok(false)
+    );
+    assert_eq!(l.note_scan_at(t0 + 120_000 + step, err.clone()), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000 + step));
+    // The error clears: written at once.
+    assert_eq!(l.note_scan_at(t0 + 120_000 + step + 1, None), Ok(true));
+    assert_eq!(on_disk().last_scan_error, None);
+    // Any other commit carries the exact in-memory time to disk and resets the interval.
+    assert_eq!(l.note_scan_at(t0 + 200_000 + step, None), Ok(false));
+    l.put(entry(ID_A, MirrorState::Current)).unwrap();
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 200_000 + step));
+    assert_eq!(
+        l.note_scan_at(t0 + 200_000 + step + step - 1, None),
+        Ok(false)
+    );
+    assert_eq!(l.note_scan_at(t0 + 200_000 + step + step, None), Ok(true));
+    // A fresh open compares against the persisted time, not the exact one.
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    assert_eq!(
+        l.note_scan_at(t0 + 200_000 + step + step + 1, None),
+        Ok(false)
     );
 }

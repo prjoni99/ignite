@@ -2391,6 +2391,7 @@ fn refresh_tools_mirror(
         sync_linked: crate::sync_outbound::with_global(|_| ()).is_some(),
         queued: run.map_or(0, |r| r.queue.len()),
         skipped: clock.last_skipped,
+        last_scan_unix_ms: clock.last_scan_unix_ms,
     };
     let now = crate::mirror::unix_now_ms();
     ui.tools.mirror = match crate::mirror::MirrorLedger::open(library_root) {
@@ -4602,6 +4603,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                 if crate::mirror::scan_due(&mirror_clock, now, batches) {
                     mirror_clock.last_scan = Some(now);
                     mirror_clock.last_batches = batches;
+                    mirror_clock.last_scan_unix_ms = Some(crate::mirror::unix_now_ms());
                     match crate::mirror::MirrorLedger::open(library.root()) {
                         Ok(mut ledger) => match crate::mirror::scan(
                             &crate::nbk_import::ImportSources::kindle(),

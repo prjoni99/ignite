@@ -132,7 +132,13 @@ pub struct MirrorLedgerV1 {
 pub struct MirrorLedger {
     path: PathBuf,
     pub data: MirrorLedgerV1,
+    /// `last_scan_unix_ms` as last written to disk (see [`MirrorLedger::note_scan_at`]).
+    scan_persisted_ms: Option<u64>,
 }
+
+/// A scan that changed nothing is written to the ledger at most this often; the in-memory
+/// time stays exact and the Tools block reads it from [`MirrorClock`].
+pub const SCAN_NOTE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -163,7 +169,11 @@ impl MirrorLedger {
             },
             Err(e) => return Err(format!("REFUSE MIRROR: read mirror ledger: {e}")),
         };
-        Ok(Self { path, data })
+        Ok(Self {
+            path,
+            scan_persisted_ms: data.last_scan_unix_ms,
+            data,
+        })
     }
 
     /// Apply `f`, persist atomically, and restore the previous in-memory state if the write
@@ -178,6 +188,7 @@ impl MirrorLedger {
             self.data = prev;
             return Err(format!("mirror ledger write: {e}"));
         }
+        self.scan_persisted_ms = self.data.last_scan_unix_ms;
         Ok(())
     }
 
@@ -205,12 +216,28 @@ impl MirrorLedger {
         })
     }
 
-    /// Record a scan attempt now, with its error if it failed.
-    pub fn note_scan(&mut self, error: Option<String>) -> Result<(), String> {
-        self.commit(|d| {
-            d.last_scan_unix_ms = Some(now_ms());
-            d.last_scan_error = error;
-        })
+    /// Record a scan attempt now, with its error if it failed. See [`Self::note_scan_at`].
+    pub fn note_scan(&mut self, error: Option<String>) -> Result<bool, String> {
+        self.note_scan_at(now_ms(), error)
+    }
+
+    /// Record a scan attempt at `now_ms`. The time and error are always updated in memory;
+    /// the ledger is written (an fsync on every scan otherwise) only when the error changed
+    /// or the last write is at least [`SCAN_NOTE_INTERVAL`] old. Returns whether it wrote.
+    pub fn note_scan_at(&mut self, now_ms: u64, error: Option<String>) -> Result<bool, String> {
+        let changed = self.data.last_scan_error != error;
+        let due = self
+            .scan_persisted_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= SCAN_NOTE_INTERVAL.as_millis() as u64);
+        if changed || due {
+            self.commit(|d| {
+                d.last_scan_unix_ms = Some(now_ms);
+                d.last_scan_error = error;
+            })?;
+            return Ok(true);
+        }
+        self.data.last_scan_unix_ms = Some(now_ms);
+        Ok(false)
     }
 }
 
@@ -1062,6 +1089,9 @@ pub struct MirrorClock {
     pub recovery_done: bool,
     /// Listed sources the last completed scan skipped ([`MirrorScan::skipped`]).
     pub last_skipped: usize,
+    /// Wall-clock time of the last scan attempt; exact even when the ledger's own copy was
+    /// not written (see [`MirrorLedger::note_scan_at`]).
+    pub last_scan_unix_ms: Option<u64>,
 }
 
 /// Should crash recovery run now? Once per process, and only once sync is linked, so the
@@ -1143,6 +1173,8 @@ pub struct MirrorLive {
     pub sync_linked: bool,
     pub queued: usize,
     pub skipped: usize,
+    /// The runtime's exact last scan time; the later of it and the ledger's copy is shown.
+    pub last_scan_unix_ms: Option<u64>,
 }
 
 /// Summarize the ledger for the Tools screen.
@@ -1155,7 +1187,7 @@ pub fn summary(ledger: &MirrorLedger, live: MirrorLive, now_unix_ms: u64) -> Mir
         skipped: live.skipped,
         current: count(MirrorState::Current),
         pending: count(MirrorState::Rebuilding) + live.queued,
-        last_scan_unix_ms: d.last_scan_unix_ms,
+        last_scan_unix_ms: live.last_scan_unix_ms.max(d.last_scan_unix_ms),
         last_scan_error: d.last_scan_error.clone(),
         unsupported: d
             .entries
