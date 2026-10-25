@@ -46,12 +46,15 @@ pub enum Modal {
     CardMenu {
         notebook_id: String,
         title: String,
+        /// An Amazon mirror (read-only): the menu also offers COPY TO IGNITE.
+        mirror: bool,
     },
     /// Notebook menu for a notebook inside `folder_id`.
     CardMenuInFolder {
         notebook_id: String,
         title: String,
         folder_id: String,
+        mirror: bool,
     },
     /// + NEW on the main list: notebook or folder.
     NewChooser {
@@ -179,6 +182,8 @@ pub enum ButtonId {
     PickerNext,
     Jump,
     RemoveLink,
+    /// Mirror card menu: import an editable copy.
+    CopyToIgnite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,30 +212,46 @@ fn button(id: ButtonId, label: &str) -> DialogButton {
     }
 }
 
+/// A mirror notebook's menu leads with COPY TO IGNITE.
+fn card_menu_buttons(mirror: bool, rest: Vec<DialogButton>) -> Vec<DialogButton> {
+    if !mirror {
+        return rest;
+    }
+    let mut buttons = vec![button(ButtonId::CopyToIgnite, "COPY TO IGNITE")];
+    buttons.extend(rest);
+    buttons
+}
+
 /// Dialog content for every modal except the full-screen title editor.
 pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
     Some(match modal {
-        Modal::CardMenu { title, .. } => DialogSpec {
+        Modal::CardMenu { title, mirror, .. } => DialogSpec {
             heading: title.clone(),
             body: Vec::new(),
-            buttons: vec![
-                button(ButtonId::Rename, "RENAME"),
-                button(ButtonId::AddToFolder, "ADD TO FOLDER"),
-                button(ButtonId::DeleteNotebook, "DELETE"),
-                button(ButtonId::Cancel, "CANCEL"),
-            ],
+            buttons: card_menu_buttons(
+                *mirror,
+                vec![
+                    button(ButtonId::Rename, "RENAME"),
+                    button(ButtonId::AddToFolder, "ADD TO FOLDER"),
+                    button(ButtonId::DeleteNotebook, "DELETE"),
+                    button(ButtonId::Cancel, "CANCEL"),
+                ],
+            ),
             vertical: true,
         },
-        Modal::CardMenuInFolder { title, .. } => DialogSpec {
+        Modal::CardMenuInFolder { title, mirror, .. } => DialogSpec {
             heading: title.clone(),
             body: Vec::new(),
-            buttons: vec![
-                button(ButtonId::Rename, "RENAME"),
-                button(ButtonId::ChangeFolder, "CHANGE FOLDER"),
-                button(ButtonId::RemoveFromFolder, "REMOVE FROM FOLDER"),
-                button(ButtonId::DeleteNotebook, "DELETE"),
-                button(ButtonId::Cancel, "CANCEL"),
-            ],
+            buttons: card_menu_buttons(
+                *mirror,
+                vec![
+                    button(ButtonId::Rename, "RENAME"),
+                    button(ButtonId::ChangeFolder, "CHANGE FOLDER"),
+                    button(ButtonId::RemoveFromFolder, "REMOVE FROM FOLDER"),
+                    button(ButtonId::DeleteNotebook, "DELETE"),
+                    button(ButtonId::Cancel, "CANCEL"),
+                ],
+            ),
             vertical: true,
         },
         Modal::NewChooser { .. } => DialogSpec {

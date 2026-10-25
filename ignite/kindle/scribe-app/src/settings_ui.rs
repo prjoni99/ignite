@@ -1,7 +1,7 @@
 //! Settings chrome: peer tabs `TOOLS` and `PREFERENCES` (Home → tools icon).
 //!
 //! Tools still owns Import Kindle notebooks. Preferences owns replica-local options
-//! (side-button action). Neither view is a writing surface.
+//! (side-button action, Amazon mirror switch). Neither view is a writing surface.
 
 use kindle_platform::FbGeometry;
 
@@ -113,6 +113,8 @@ pub enum PreferencesHit {
     Chrome(SettingsChromeHit),
     NavigationUndo,
     CreateLink,
+    /// Amazon mirror on/off.
+    MirrorToggle,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +122,7 @@ pub struct PreferencesLayout {
     pub chrome: SettingsChrome,
     pub nav_undo: Rect,
     pub create_link: Rect,
+    pub mirror_toggle: Rect,
 }
 
 const SECTION_Y: u32 = 260;
@@ -127,6 +130,10 @@ const BODY_Y: u32 = 360;
 const CHOICE_Y: u32 = 720;
 const CHOICE_H: u32 = 200;
 const CHOICE_GAP: u32 = 40;
+/// AMAZON MIRROR section below the side-button choices (heading, blurb, toggle row).
+const MIRROR_SECTION_Y: u32 = CHOICE_Y + 2 * (CHOICE_H + CHOICE_GAP) + 80;
+const MIRROR_BODY_Y: u32 = MIRROR_SECTION_Y + 100;
+const MIRROR_ROW_Y: u32 = MIRROR_BODY_Y + 160;
 
 impl PreferencesLayout {
     pub fn new(geo: &FbGeometry) -> Self {
@@ -135,6 +142,7 @@ impl PreferencesLayout {
             chrome: SettingsChrome::new(geo),
             nav_undo: Rect::new(MARGIN, CHOICE_Y, w, CHOICE_H),
             create_link: Rect::new(MARGIN, CHOICE_Y + CHOICE_H + CHOICE_GAP, w, CHOICE_H),
+            mirror_toggle: Rect::new(MARGIN, MIRROR_ROW_Y, w, CHOICE_H),
         }
     }
 
@@ -148,16 +156,29 @@ impl PreferencesLayout {
         if self.create_link.contains(x, y) {
             return Some(PreferencesHit::CreateLink);
         }
+        if self.mirror_toggle.contains(x, y) {
+            return Some(PreferencesHit::MirrorToggle);
+        }
         None
     }
 }
 
 const SIDE_BUTTON_BLURB: &str = "Choose what the pen side button does while you are on a page.";
+const MIRROR_BLURB: &str = "Keep a read-only copy of your Kindle notebooks in the Amazon folder.";
+
+pub fn mirror_toggle_label(enabled: bool) -> &'static str {
+    if enabled {
+        "Mirror Amazon notebooks: On"
+    } else {
+        "Mirror Amazon notebooks: Off"
+    }
+}
 
 pub fn render_preferences(
     fb: &mut [u8],
     geo: &FbGeometry,
     action: SideButtonAction,
+    mirror_enabled: bool,
 ) -> Result<(), String> {
     let layout = PreferencesLayout::new(geo);
     let mut c = Canvas::new(fb, geo)?;
@@ -182,6 +203,34 @@ pub fn render_preferences(
         "CREATE LINK",
         "A side-button tap starts a link at that spot.",
         action == SideButtonAction::CreateLink,
+    );
+    c.text(MARGIN, MIRROR_SECTION_Y, 9, "AMAZON MIRROR", BLACK);
+    for (i, line) in wrap_text(MIRROR_BLURB, 6, w, 2).iter().enumerate() {
+        c.text(MARGIN, MIRROR_BODY_Y + i as u32 * 64, 6, line, BLACK);
+    }
+    let r = layout.mirror_toggle;
+    c.frame(r, 5, BLACK);
+    c.text(
+        r.x + 40,
+        r.y + 40,
+        8,
+        &fit_text(
+            mirror_toggle_label(mirror_enabled),
+            8,
+            r.w.saturating_sub(80),
+        ),
+        BLACK,
+    );
+    c.text(
+        r.x + 40,
+        r.y + 120,
+        5,
+        if mirror_enabled {
+            "Tap to turn off."
+        } else {
+            "Tap to turn on."
+        },
+        BLACK,
     );
     Ok(())
 }
@@ -232,9 +281,28 @@ mod tests {
         assert_eq!(l.hit(x, y), Some(PreferencesHit::NavigationUndo));
         let (x, y) = center(l.create_link);
         assert_eq!(l.hit(x, y), Some(PreferencesHit::CreateLink));
+        let (x, y) = center(l.mirror_toggle);
+        assert_eq!(l.hit(x, y), Some(PreferencesHit::MirrorToggle));
+        // The toggle row sits below the side-button choices, same width, never overlapping.
+        assert!(l.mirror_toggle.y >= l.create_link.bottom() + CHOICE_GAP);
+        assert_eq!(
+            (l.mirror_toggle.x, l.mirror_toggle.w, l.mirror_toggle.h),
+            (l.create_link.x, l.create_link.w, CHOICE_H)
+        );
+        assert!(l.mirror_toggle.bottom() < g.yres - 200);
+        assert_eq!(l.hit(x, l.create_link.bottom() + 1), None);
+        assert_eq!(mirror_toggle_label(true), "Mirror Amazon notebooks: On");
+        assert_eq!(mirror_toggle_label(false), "Mirror Amazon notebooks: Off");
         let mut fb = vec![0x55; g.smem_len as usize];
-        render_preferences(&mut fb, &g, SideButtonAction::NavigationUndo).unwrap();
-        render_preferences(&mut fb, &g, SideButtonAction::CreateLink).unwrap();
+        for mirror in [false, true] {
+            render_preferences(&mut fb, &g, SideButtonAction::NavigationUndo, mirror).unwrap();
+            render_preferences(&mut fb, &g, SideButtonAction::CreateLink, mirror).unwrap();
+            for y in 0..g.yres as usize {
+                let pad = &fb[y * g.line_length as usize + g.xres as usize
+                    ..(y + 1) * g.line_length as usize];
+                assert!(pad.iter().all(|b| *b == 0x55));
+            }
+        }
     }
 
     #[test]

@@ -1048,6 +1048,55 @@ pub fn scan_allowed(view: AppView, import_running: bool, sync_linked: bool) -> b
     step_allowed(view, import_running, sync_linked)
 }
 
+// ---------------------------------------------------------------------------- summary
+
+/// What the Tools screen shows about the mirror. Built from the ledger without touching the
+/// Kindle's files (no stat, no decode).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorSummary {
+    pub enabled: bool,
+    /// Ledger entries in step with Amazon.
+    pub current: usize,
+    /// `Rebuilding` entries plus actions still queued in the running pass.
+    pub pending: usize,
+    pub last_scan_unix_ms: Option<u64>,
+    pub last_scan_error: Option<String>,
+    /// `(title, error)` of `Unsupported` entries, in origin-id order.
+    pub unsupported: Vec<(String, String)>,
+    /// When the summary was taken (the "last scan N ago" reference point).
+    pub now_unix_ms: u64,
+}
+
+/// Summarize the ledger for the Tools screen. `queued` is the running pass's queue length.
+pub fn summary(
+    ledger: &MirrorLedger,
+    enabled: bool,
+    queued: usize,
+    now_unix_ms: u64,
+) -> MirrorSummary {
+    let d = &ledger.data;
+    let count = |s: MirrorState| d.entries.values().filter(|e| e.state == s).count();
+    MirrorSummary {
+        enabled,
+        current: count(MirrorState::Current),
+        pending: count(MirrorState::Rebuilding) + queued,
+        last_scan_unix_ms: d.last_scan_unix_ms,
+        last_scan_error: d.last_scan_error.clone(),
+        unsupported: d
+            .entries
+            .values()
+            .filter(|e| e.state == MirrorState::Unsupported)
+            .map(|e| (e.title.clone(), e.error.clone().unwrap_or_default()))
+            .collect(),
+        now_unix_ms,
+    }
+}
+
+/// Wall-clock now in Unix milliseconds (0 if the clock is before the epoch).
+pub fn unix_now_ms() -> u64 {
+    now_ms()
+}
+
 #[cfg(test)]
 #[path = "mirror_tests.rs"]
 mod tests;

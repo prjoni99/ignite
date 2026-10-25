@@ -415,7 +415,8 @@ mod tests {
             ui.modal,
             Some(Modal::CardMenu {
                 notebook_id: "notebook-2".into(),
-                title: "Notebook 2".into()
+                title: "Notebook 2".into(),
+                mirror: false,
             })
         );
         let modal = ui.modal.clone().unwrap();
@@ -604,6 +605,7 @@ mod tests {
         ui.show_modal(Modal::CardMenu {
             notebook_id: "notebook-2".into(),
             title: "Personal".into(),
+            mirror: false,
         });
         let m = ui.modal.clone().unwrap();
         ui.on_tap(&g, dialog_button(&g, &m, "RENAME"), &c, "x", None);
@@ -753,6 +755,7 @@ mod tests {
         let menu = Modal::CardMenu {
             notebook_id: "notebook-1".into(),
             title: "Work".into(),
+            mirror: false,
         };
         // First Delete tap never deletes: it asks.
         let mut ui = home_ui(2, 0);

@@ -1449,3 +1449,58 @@ fn a_scan_error_never_removes_existing_mirrors() {
     assert_eq!(reopened.data.entries, before.entries);
     assert_eq!(reopened.data.last_scan_error, Some(err));
 }
+
+#[test]
+fn summary_counts_ledger_states_and_carries_the_last_scan() {
+    let mut data = MirrorLedgerV1 {
+        v: 1,
+        last_scan_unix_ms: Some(1_000),
+        last_scan_error: Some("Kindle catalog: locked".into()),
+        ..Default::default()
+    };
+    for (id, state) in [
+        (ID_A, MirrorState::Current),
+        (ID_B, MirrorState::Current),
+        (ID_C, MirrorState::Rebuilding),
+        (ID_D, MirrorState::Removed),
+    ] {
+        data.entries.insert(id.into(), entry(id, state));
+    }
+    data.entries.insert(
+        ID_E.into(),
+        MirrorEntryV1 {
+            title: "Sketches".into(),
+            error: Some("NBK_UNSUPPORTED: v9".into()),
+            ..entry(ID_E, MirrorState::Unsupported)
+        },
+    );
+    let ledger = MirrorLedger {
+        path: PathBuf::new(),
+        data,
+    };
+    let s = summary(&ledger, true, 2, 181_000);
+    assert_eq!(
+        s,
+        MirrorSummary {
+            enabled: true,
+            current: 2,
+            // One Rebuilding entry plus two queued actions.
+            pending: 3,
+            last_scan_unix_ms: Some(1_000),
+            last_scan_error: Some("Kindle catalog: locked".into()),
+            unsupported: vec![("Sketches".into(), "NBK_UNSUPPORTED: v9".into())],
+            now_unix_ms: 181_000,
+        }
+    );
+    let empty = MirrorLedger {
+        path: PathBuf::new(),
+        data: MirrorLedgerV1::default(),
+    };
+    assert_eq!(
+        summary(&empty, false, 0, 5),
+        MirrorSummary {
+            now_unix_ms: 5,
+            ..MirrorSummary::default()
+        }
+    );
+}

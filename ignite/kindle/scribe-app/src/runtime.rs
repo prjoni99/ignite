@@ -318,10 +318,16 @@ impl KindleTransport {
     fn render_preferences(
         &mut self,
         action: SideButtonAction,
+        mirror_enabled: bool,
         dialog: Option<&DialogSpec>,
     ) -> Result<(), String> {
         self.chrome_on_panel = false;
-        crate::settings_ui::render_preferences(self.fb.as_slice_mut(), &self.geometry, action)?;
+        crate::settings_ui::render_preferences(
+            self.fb.as_slice_mut(),
+            &self.geometry,
+            action,
+            mirror_enabled,
+        )?;
         if let Some(spec) = dialog {
             render_dialog(self.fb.as_slice_mut(), &self.geometry, spec)?;
         }
@@ -1212,6 +1218,7 @@ fn navigate(
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
     action: NavDownAction,
+    allow_create: bool,
 ) -> Result<bool, String> {
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         // Mid-stroke: ignore navigation.
@@ -1246,6 +1253,10 @@ fn navigate(
                     PageSwitchDirection::Next,
                     false,
                 )
+            } else if !allow_create {
+                // Mirror (read-only) notebook: Next on the last page never creates one.
+                println!("nav_create_refused reason=read_only page={from} page_count={page_count}");
+                return Ok(false);
             } else if !crate::nav::may_create_page_on_right_nav(ctrl.store().has_authored_history())
             {
                 println!(
@@ -1927,6 +1938,8 @@ fn handle_lasso_action(
     last_move_undo: &mut Option<MoveCommit>,
     cached_move_ids: &mut Option<HashSet<String>>,
     frame_diag: Option<TouchFrameDiag>,
+    read_only: bool,
+    read_only_hint_due: &mut bool,
 ) -> Result<bool, String> {
     match action {
         FingerAction::Tap(_) | FingerAction::NextPage | FingerAction::PreviousPage => {
@@ -1934,6 +1947,10 @@ fn handle_lasso_action(
         }
         FingerAction::SelectionCleared => {
             clear_lasso_overlay(ctrl, lasso, overlay, cached_move_ids)?;
+        }
+        // Mirror notebook: no lasso, so no selection can ever be moved (committed).
+        FingerAction::LassoStarted(_) if read_only => {
+            *read_only_hint_due = true;
         }
         FingerAction::LassoStarted(point) => {
             if !ctrl.is_idle() || ctrl.is_armed() {
@@ -2203,6 +2220,10 @@ struct UiExec<'a> {
     session_read_only: &'a mut bool,
     /// The read-only hint was already shown since the notebook was opened.
     read_only_hint_shown: &'a mut bool,
+    /// A refused touch on the read-only notebook asks for the hint at the next safe point.
+    read_only_hint_due: &'a mut bool,
+    /// When the last mirror scan ran (`MirrorRescan` clears it to force one).
+    mirror_clock: &'a mut crate::mirror::MirrorClock,
     /// Replica-local preferences.json (outside the library).
     prefs_path: &'a Path,
     /// `--sync-dir` (Restore from Server replaces it with the library).
@@ -2362,6 +2383,105 @@ fn is_mirror_notebook_dir(dir: &Path) -> bool {
     dir.join(crate::mirror::MIRROR_MARKER).is_file()
 }
 
+/// Refresh the Tools screen's mirror block from the ledger (no Kindle file is touched).
+fn refresh_tools_mirror(
+    ui: &mut UiState,
+    library_root: &Path,
+    run: Option<&crate::mirror::MirrorRun>,
+) {
+    let queued = run.map_or(0, |r| r.queue.len());
+    let now = crate::mirror::unix_now_ms();
+    ui.tools.mirror = match crate::mirror::MirrorLedger::open(library_root) {
+        Ok(ledger) => crate::mirror::summary(&ledger, ui.mirror_enabled, queued, now),
+        Err(e) => {
+            eprintln!("mirror_summary_failed detail={e}");
+            crate::mirror::MirrorSummary {
+                enabled: ui.mirror_enabled,
+                pending: queued,
+                last_scan_error: Some(e),
+                now_unix_ms: now,
+                ..Default::default()
+            }
+        }
+    };
+}
+
+/// Home card menu → COPY TO IGNITE: import an editable copy of the mirror's Kindle source
+/// (the regular one-way import, so a second copy is refused as already imported). Runs from
+/// the Home modal at a safe point, never on the pen path; large notebooks take seconds, as
+/// "Import all" does.
+fn copy_mirror(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl, notebook_id: &str) -> Result<(), String> {
+    use crate::nbk_import::{discover, import_one, GlobalSync, ImportOutcome, ImportSources};
+    use crate::nbk_import::{ImportTarget, Ledger};
+    let marker = x
+        .library
+        .notebook_dir(notebook_id)
+        .join(crate::mirror::MIRROR_MARKER);
+    let origin = std::fs::read(&marker)
+        .map_err(|e| format!("read {}: {e}", marker.display()))
+        .and_then(|b| {
+            serde_json::from_slice::<crate::mirror::MirrorOriginV1>(&b)
+                .map_err(|e| format!("unreadable mirror marker {}: {e}", marker.display()))
+        });
+    let origin_id = match origin {
+        Ok(m) => m.origin_id,
+        Err(e) => {
+            eprintln!("copy_mirror_failed notebook={notebook_id} detail={e}");
+            x.ui.show_error("The notebook couldn't be copied.");
+            return present_ui(x, ctrl, None);
+        }
+    };
+    let source = match discover(&ImportSources::kindle()) {
+        Ok(all) => all.into_iter().find(|s| s.origin_id == origin_id),
+        Err(e) => {
+            eprintln!("copy_mirror_failed notebook={notebook_id} origin={origin_id} detail={e}");
+            x.ui.show_error("The notebook couldn't be copied.");
+            return present_ui(x, ctrl, None);
+        }
+    };
+    let Some(source) = source else {
+        println!("copy_mirror_missing notebook={notebook_id} origin={origin_id}");
+        x.ui.show_error("That Kindle notebook is no longer on this device.");
+        return present_ui(x, ctrl, None);
+    };
+    let paper = paper_background(&x.geo);
+    let t0 = Instant::now();
+    let outcome = match Ledger::open(x.library.root()) {
+        Ok(mut ledger) => {
+            let mut target = ImportTarget {
+                library: &mut *x.library,
+                profile: &*x.notebook_profile,
+                geo: &x.geo,
+                paper: &paper,
+                cancel: x.stop,
+            };
+            import_one(&mut target, &mut ledger, &source, &GlobalSync)
+        }
+        Err(e) => ImportOutcome::Failed(e),
+    };
+    let ms = t0.elapsed().as_millis();
+    match outcome {
+        ImportOutcome::Imported {
+            notebook_id: copy,
+            pages,
+            ..
+        } => {
+            println!("copy_mirror_done mirror={notebook_id} origin={origin_id} notebook={copy} pages={pages} ms={ms}");
+        }
+        ImportOutcome::AlreadyImported => {
+            println!("copy_mirror_skipped mirror={notebook_id} origin={origin_id} reason=already_imported");
+            x.ui.show_error("Already copied to Ignite.");
+        }
+        ImportOutcome::Failed(e) | ImportOutcome::Halted(e) => {
+            eprintln!(
+                "copy_mirror_failed notebook={notebook_id} origin={origin_id} ms={ms} detail={e}"
+            );
+            x.ui.show_error("The notebook couldn't be copied.");
+        }
+    }
+    present_ui(x, ctrl, None)
+}
+
 /// Apply the next queued Amazon mirror action. Runs only at the structural safe point and only
 /// where [`crate::mirror::step_allowed`] admits it (Home/Tools), never with a page open.
 fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
@@ -2429,6 +2549,10 @@ fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
                 run.queue.len()
             );
             *x.mirror_run = None;
+            if x.ui.view == AppView::Tools && !x.ui.modal_open() {
+                refresh_tools_mirror(x.ui, x.library.root(), None);
+                return present_ui(x, ctrl, None);
+            }
             return Ok(());
         }
     };
@@ -2440,6 +2564,11 @@ fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
         if done > 0 && x.ui.view == AppView::Home && !x.ui.modal_open() {
             return present_ui(x, ctrl, None);
         }
+    }
+    // Tools shows the mirror's progress: refresh it after every step.
+    if x.ui.view == AppView::Tools && !x.ui.modal_open() {
+        refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+        return present_ui(x, ctrl, None);
     }
     Ok(())
 }
@@ -2489,6 +2618,7 @@ fn active_notebook_index(library: &LibraryRepository) -> usize {
 fn refresh_folder_view(ui: &mut UiState, folders: &FolderStore, library: &LibraryRepository) {
     ui.folders = folders.view(&library.manifest().notebook_ids);
     ui.next_folder_title = folders.next_default_title();
+    ui.notebooks_root = Some(library.root().join(crate::library::NOTEBOOKS_DIR));
 }
 
 /// Run one folder-store mutation from the UI; failures become an error modal.
@@ -2617,8 +2747,11 @@ fn present_ui(
         AppView::Tools => ctrl.transport_mut().render_tools(&x.ui.tools),
         AppView::Preferences => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
-            ctrl.transport_mut()
-                .render_preferences(x.ui.side_button, dialog.as_ref())
+            ctrl.transport_mut().render_preferences(
+                x.ui.side_button,
+                x.ui.mirror_enabled,
+                dialog.as_ref(),
+            )
         }
         AppView::LinkTargetPicker => {
             let dialog = x.ui.modal.as_ref().and_then(dialog_spec);
@@ -2776,6 +2909,7 @@ fn open_notebook_from_ui(
 ) -> Result<(), String> {
     crate::launch_clock::mark("notebook_open_start");
     *x.read_only_hint_shown = false;
+    *x.read_only_hint_due = false;
     // A mirror notebook is never re-entered from memory: a rebuild may have replaced its pages
     // while Home was showing.
     if ctrl.store().is_bound()
@@ -3199,20 +3333,53 @@ fn execute_ui_command(
     x: &mut UiExec<'_>,
     ctrl: &mut KindleCtrl,
 ) -> Result<(), String> {
+    // Mirror notebook: refuse every page/notebook mutation (rename only of the open one).
+    if *x.session_read_only
+        && crate::app_ui::mutates_open_notebook(&cmd)
+        && !matches!(&cmd, UiCommand::RenameNotebook { notebook_id, .. }
+            if *notebook_id != x.manifest.notebook_id)
+    {
+        println!("mirror_read_only_refused command={cmd:?}");
+        x.ui.show_error(READ_ONLY_HINT);
+        return present_ui(x, ctrl, None);
+    }
     match cmd {
         UiCommand::None => Ok(()),
         UiCommand::Redraw(Redraw::Full) => present_ui(x, ctrl, None),
         UiCommand::Redraw(Redraw::Region(r)) => present_ui(x, ctrl, Some(r)),
         UiCommand::OpenTools => {
             x.ui.enter_tools();
+            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
             println!("app_view=tools");
             present_ui(x, ctrl, None)
         }
         UiCommand::ShowToolsTab => {
             x.ui.show_tools_tab();
+            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
             println!("app_view=tools tab=tools");
             present_ui(x, ctrl, None)
         }
+        UiCommand::MirrorRescan => {
+            // The scan itself runs at the next structural safe point (same gate as always).
+            x.mirror_clock.last_scan = None;
+            println!("mirror_rescan_requested=true");
+            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::SetMirrorEnabled(enabled) => {
+            match prefs::save_mirror_enabled(x.prefs_path, enabled) {
+                Ok(()) => {
+                    x.ui.mirror_enabled = enabled;
+                    println!("mirror_amazon_enabled={enabled}");
+                }
+                Err(e) => {
+                    eprintln!("preferences_save_failed detail={e}");
+                    x.ui.show_error("The preference couldn't be saved.");
+                }
+            }
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::CopyMirror(notebook_id) => copy_mirror(x, ctrl, &notebook_id),
         UiCommand::OpenPreferences => {
             x.ui.enter_preferences();
             println!("app_view=preferences");
@@ -3594,6 +3761,7 @@ fn execute_ui_command(
                 x.notebook_profile,
                 x.current_bg,
                 action,
+                !*x.session_read_only,
             )
             .map(|_| ())
             .map_err(|e| format!("error: page navigation: {e}"))
@@ -3986,8 +4154,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut ui = UiState::launch_home(active_notebook_index(&library), launch_cards.len());
     let prefs_path = prefs::preferences_path(cfg.sync_dir.as_deref(), cfg.device_dir.as_deref());
     ui.side_button = prefs::load_side_button(&prefs_path);
-    let mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
-    println!("mirror_amazon_enabled={mirror_enabled}");
+    ui.mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
+    println!("mirror_amazon_enabled={}", ui.mirror_enabled);
     if product_sync {
         ui.enable_sync();
     }
@@ -4178,6 +4346,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     mirror_run: &mut mirror_run,
                     session_read_only: &mut session_read_only,
                     read_only_hint_shown: &mut read_only_hint_shown,
+                    read_only_hint_due: &mut read_only_hint_due,
+                    mirror_clock: &mut mirror_clock,
                     prefs_path: &prefs_path,
                     sync_dir: cfg.sync_dir.as_deref(),
                     lasso: &mut lasso,
@@ -4341,6 +4511,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             && pending_ui.is_none()
             && read_only_hint_due
             && session_read_only
+            && !read_only_hint_shown
             && ui.view == AppView::Notebook
             && !ui.modal_open()
         {
@@ -4366,7 +4537,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         if structure_eligible
             && pending_ui.is_none()
             && !ui.modal_open()
-            && (mirror_run.is_some() || mirror_enabled)
+            && (mirror_run.is_some() || ui.mirror_enabled)
             && matches!(ui.view, AppView::Home | AppView::Tools)
         {
             let sync_linked = crate::sync_outbound::with_global(|_| ()).is_some();
@@ -4377,7 +4548,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             );
             // Scan: stat-only, at launch, after an upload batch, or after 15 idle minutes.
             if mirror_run.is_none()
-                && mirror_enabled
+                && ui.mirror_enabled
                 && pen_quiet
                 && crate::mirror::scan_allowed(ui.view, import_run.is_some(), sync_linked)
             {
@@ -4417,6 +4588,10 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                             }
                         },
                         Err(e) => eprintln!("mirror_scan_failed detail={e}"),
+                    }
+                    if ui.view == AppView::Tools {
+                        refresh_tools_mirror(&mut ui, library.root(), mirror_run.as_ref());
+                        pending_ui = Some(UiCommand::Redraw(Redraw::Full));
                     }
                     continue;
                 }
@@ -4709,6 +4884,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                 &mut last_move_undo,
                                 &mut cached_move_ids,
                                 None,
+                                session_read_only,
+                                &mut read_only_hint_due,
                             ) {
                                 touch_fatal = Some(e);
                                 break;
@@ -4740,6 +4917,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                     &mut last_move_undo,
                                     &mut cached_move_ids,
                                     None,
+                                    session_read_only,
+                                    &mut read_only_hint_due,
                                 ) {
                                     touch_fatal = Some(e);
                                     break;
@@ -4809,6 +4988,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                             &mut last_move_undo,
                             &mut cached_move_ids,
                             Some(frame_diag),
+                            session_read_only,
+                            &mut read_only_hint_due,
                         ) {
                             Ok(true) => continue,
                             Ok(false) => {}
@@ -4898,6 +5079,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     &mut last_move_undo,
                     &mut cached_move_ids,
                     None,
+                    session_read_only,
+                    &mut read_only_hint_due,
                 ) {
                     touch_fatal = Some(e);
                 }
@@ -4956,6 +5139,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                 &mut last_move_undo,
                 &mut cached_move_ids,
                 None,
+                session_read_only,
+                &mut read_only_hint_due,
             ) {
                 eprintln!("error: touch cancellation: {e}");
                 let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
@@ -5132,6 +5317,12 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                     NavDownAction::IgnoreNoInk => {
                                         // Consume contact until Up: no ink, undo, switch, or persist.
                                     }
+                                    NavDownAction::UndoLastStroke if session_read_only => {
+                                        // Mirror notebook: nothing to undo; consume until Up.
+                                        if !read_only_hint_shown {
+                                            read_only_hint_due = true;
+                                        }
+                                    }
                                     NavDownAction::UndoLastStroke => {
                                         ctrl.totals.undo_gestures += 1;
                                         if !ctrl.is_idle() || ctrl.is_armed() {
@@ -5163,6 +5354,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                             &notebook_profile,
                                             &mut current_bg,
                                             act,
+                                            !session_read_only,
                                         ) {
                                             Ok(_) => {}
                                             Err(e) => {

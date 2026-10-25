@@ -4,6 +4,7 @@
 
 use kindle_platform::FbGeometry;
 
+use crate::mirror::MirrorSummary;
 use crate::settings_ui::{
     paint_settings_chrome, SettingsChrome, SettingsChromeHit, SettingsTab, DIVIDER_Y,
 };
@@ -12,11 +13,22 @@ use crate::ui_gfx::{fit_text, wrap_text, Canvas, Rect, BLACK, WHITE};
 const MARGIN: u32 = 60;
 const SECTION_Y: u32 = 260;
 const BODY_Y: u32 = 400;
-const STATUS_Y: u32 = 760;
-const BUTTON_Y: u32 = 1560;
-const BUTTON_H: u32 = 180;
-const SECONDARY_Y: u32 = 1780;
-const SECONDARY_H: u32 = 150;
+const STATUS_Y: u32 = 720;
+const STATUS_BOTTOM: u32 = 1350;
+const STATUS_LINE_Y: u32 = 130;
+const STATUS_LINE_STEP: u32 = 56;
+const BUTTON_Y: u32 = 1390;
+const BUTTON_H: u32 = 150;
+const SECONDARY_Y: u32 = 1560;
+const SECONDARY_H: u32 = 120;
+/// Amazon mirror block: heading, status lines, then `RESCAN NOW` (above the version label).
+const MIRROR_SECTION_Y: u32 = 1730;
+const MIRROR_BODY_Y: u32 = 1810;
+const MIRROR_LINE_STEP: u32 = 50;
+/// Small enough that the 62-character summary line fits the panel width.
+const MIRROR_SCALE: u32 = 4;
+const RESCAN_Y: u32 = 2240;
+const RESCAN_H: u32 = 120;
 const MAX_FAILURE_LINES: usize = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,12 +64,15 @@ pub enum ToolsPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolsState {
     pub phase: ToolsPhase,
+    /// Amazon mirror status, refreshed by the runtime on entry and after each mirror step.
+    pub mirror: MirrorSummary,
 }
 
 impl Default for ToolsState {
     fn default() -> Self {
         Self {
             phase: ToolsPhase::Intro,
+            mirror: MirrorSummary::default(),
         }
     }
 }
@@ -73,6 +88,8 @@ pub enum ToolsHit {
     Chrome(SettingsChromeHit),
     Scan,
     ImportAll,
+    /// Amazon mirror: scan now instead of waiting for the next trigger.
+    MirrorRescan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +98,8 @@ pub struct ToolsLayout {
     /// `(rect, label, action)`; absent while importing.
     pub primary: Option<(Rect, String, ToolsHit)>,
     pub secondary: Option<(Rect, String, ToolsHit)>,
+    /// `RESCAN NOW`; only while the mirror is on and no import runs.
+    pub rescan: Option<(Rect, String, ToolsHit)>,
 }
 
 impl ToolsLayout {
@@ -109,10 +128,18 @@ impl ToolsLayout {
                 None,
             ),
         };
+        let rescan = (state.mirror.enabled && !state.busy()).then(|| {
+            (
+                Rect::new(MARGIN, RESCAN_Y, w, RESCAN_H),
+                "RESCAN NOW".to_string(),
+                ToolsHit::MirrorRescan,
+            )
+        });
         Self {
             chrome: SettingsChrome::new(geo),
             primary,
             secondary,
+            rescan,
         }
     }
 
@@ -121,7 +148,7 @@ impl ToolsLayout {
         if let Some(h) = self.chrome.hit(x, y, !state.busy()) {
             return Some(ToolsHit::Chrome(h));
         }
-        [&self.primary, &self.secondary]
+        [&self.primary, &self.secondary, &self.rescan]
             .into_iter()
             .flatten()
             .find(|(r, _, _)| r.contains(x, y))
@@ -136,8 +163,54 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-/// Headline + detail lines for the current phase.
+/// Headline + detail lines for the current phase, then the Amazon mirror block.
 pub fn status_lines(state: &ToolsState) -> (String, Vec<String>) {
+    let (headline, mut lines) = import_lines(state);
+    lines.extend(mirror_lines(&state.mirror));
+    (headline, lines)
+}
+
+/// `Xs ago` under a minute, `X min ago` under an hour, else `X h ago`.
+fn ago(ms: u64) -> String {
+    let s = ms / 1000;
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3600 {
+        format!("{} min ago", s / 60)
+    } else {
+        format!("{} h ago", s / 3600)
+    }
+}
+
+/// The Amazon mirror block: one summary line, the last scan error, then unsupported notebooks.
+pub fn mirror_lines(m: &MirrorSummary) -> Vec<String> {
+    let last = match m.last_scan_unix_ms {
+        Some(t) => ago(m.now_unix_ms.saturating_sub(t)),
+        None => "never".into(),
+    };
+    let mut lines = vec![format!(
+        "Amazon mirror: {}, {} current, {} pending, last scan {last}",
+        if m.enabled { "on" } else { "off" },
+        m.current,
+        m.pending
+    )];
+    if let Some(e) = &m.last_scan_error {
+        lines.push(format!("last scan failed: {e}"));
+    }
+    for (title, error) in m.unsupported.iter().take(MAX_FAILURE_LINES) {
+        lines.push(format!("{title}: {}", failure_reason(error)));
+    }
+    if m.unsupported.len() > MAX_FAILURE_LINES {
+        lines.push(format!(
+            "...and {} more",
+            m.unsupported.len() - MAX_FAILURE_LINES
+        ));
+    }
+    lines
+}
+
+/// Headline + detail lines for the import phase alone.
+fn import_lines(state: &ToolsState) -> (String, Vec<String>) {
     match &state.phase {
         ToolsPhase::Intro => (
             "Scan to find Kindle notebooks.".into(),
@@ -222,9 +295,9 @@ pub fn render_tools(fb: &mut [u8], geo: &FbGeometry, state: &ToolsState) -> Resu
         c.text(MARGIN, BODY_Y + i as u32 * 64, 6, line, BLACK);
     }
 
-    let status = Rect::new(MARGIN, STATUS_Y, w, BUTTON_Y - STATUS_Y - 60);
+    let status = Rect::new(MARGIN, STATUS_Y, w, STATUS_BOTTOM - STATUS_Y);
     c.frame(status, 4, BLACK);
-    let (headline, details) = status_lines(state);
+    let (headline, details) = import_lines(state);
     c.text(
         status.x + 40,
         status.y + 40,
@@ -233,7 +306,7 @@ pub fn render_tools(fb: &mut [u8], geo: &FbGeometry, state: &ToolsState) -> Resu
         BLACK,
     );
     for (i, line) in details.iter().enumerate() {
-        let y = status.y + 150 + i as u32 * 70;
+        let y = status.y + STATUS_LINE_Y + i as u32 * STATUS_LINE_STEP;
         if y + 50 > status.bottom() {
             break;
         }
@@ -253,6 +326,22 @@ pub fn render_tools(fb: &mut [u8], geo: &FbGeometry, state: &ToolsState) -> Resu
     if let Some((r, label, _)) = &layout.secondary {
         c.frame(*r, 5, BLACK);
         c.text_centered(r.inset(10), 8, label, BLACK);
+    }
+
+    c.text(MARGIN, MIRROR_SECTION_Y, 7, "AMAZON MIRROR", BLACK);
+    for (i, line) in mirror_lines(&state.mirror).iter().enumerate() {
+        let y = MIRROR_BODY_Y + i as u32 * MIRROR_LINE_STEP;
+        c.text(
+            MARGIN,
+            y,
+            MIRROR_SCALE,
+            &fit_text(line, MIRROR_SCALE, w),
+            BLACK,
+        );
+    }
+    if let Some((r, label, _)) = &layout.rescan {
+        c.frame(*r, 5, BLACK);
+        c.text_centered(r.inset(10), 7, label, BLACK);
     }
     Ok(())
 }
@@ -285,6 +374,7 @@ mod tests {
                 eligible: 2,
                 already_imported: 1,
             },
+            ..ToolsState::default()
         };
         let l = ToolsLayout::new(&g, &scanned);
         let (label, hit) = (
@@ -304,6 +394,7 @@ mod tests {
                 total: 2,
                 current: "Journal".into(),
             },
+            ..ToolsState::default()
         };
         let l = ToolsLayout::new(&g, &busy);
         assert!(l.primary.is_none() && l.secondary.is_none());
@@ -339,7 +430,15 @@ mod tests {
             ToolsPhase::Error("Kindle notebook catalog unreadable".into()),
         ] {
             let mut fb = vec![0x55; g.smem_len as usize];
-            render_tools(&mut fb, &g, &ToolsState { phase }).unwrap();
+            render_tools(
+                &mut fb,
+                &g,
+                &ToolsState {
+                    phase,
+                    mirror: MirrorSummary::default(),
+                },
+            )
+            .unwrap();
             for y in 0..g.yres as usize {
                 let pad = &fb[y * g.line_length as usize + g.xres as usize
                     ..(y + 1) * g.line_length as usize];
@@ -352,10 +451,121 @@ mod tests {
                     total: 1,
                     eligible: 1,
                     already_imported: 0
-                }
+                },
+                ..ToolsState::default()
             })
             .0,
             "Found 1 Kindle notebook."
         );
+    }
+
+    fn mirror(enabled: bool, last_scan_age_ms: Option<u64>) -> MirrorSummary {
+        let now = 10_000_000;
+        MirrorSummary {
+            enabled,
+            current: 12,
+            pending: 1,
+            last_scan_unix_ms: last_scan_age_ms.map(|a| now - a),
+            last_scan_error: None,
+            unsupported: Vec::new(),
+            now_unix_ms: now,
+        }
+    }
+
+    fn with_mirror(m: MirrorSummary) -> ToolsState {
+        ToolsState {
+            mirror: m,
+            ..ToolsState::default()
+        }
+    }
+
+    #[test]
+    fn status_lines_append_the_mirror_block() {
+        let (_, lines) = status_lines(&with_mirror(mirror(true, Some(200_000))));
+        assert_eq!(
+            lines,
+            vec![
+                "Nothing is copied until you choose Import.".to_string(),
+                "Amazon mirror: on, 12 current, 1 pending, last scan 3 min ago".into(),
+            ]
+        );
+        let (_, lines) = status_lines(&with_mirror(MirrorSummary {
+            current: 0,
+            pending: 0,
+            ..mirror(false, None)
+        }));
+        assert_eq!(
+            lines.last().unwrap(),
+            "Amazon mirror: off, 0 current, 0 pending, last scan never"
+        );
+        for (age, text) in [
+            (0, "last scan 0s ago"),
+            (59_999, "last scan 59s ago"),
+            (60_000, "last scan 1 min ago"),
+            (3_599_999, "last scan 59 min ago"),
+            (3_600_000, "last scan 1 h ago"),
+            (7_300_000, "last scan 2 h ago"),
+        ] {
+            let lines = mirror_lines(&mirror(true, Some(age)));
+            assert!(lines[0].ends_with(text), "{age}: {}", lines[0]);
+        }
+    }
+
+    #[test]
+    fn mirror_block_shows_the_scan_error_and_at_most_five_unsupported() {
+        let m = MirrorSummary {
+            last_scan_error: Some("Kindle catalog: locked".into()),
+            unsupported: (0..6)
+                .map(|i| (format!("Notebook {i}"), "NBK_UNSUPPORTED: v9".to_string()))
+                .collect(),
+            ..mirror(true, Some(1_000))
+        };
+        let (_, lines) = status_lines(&with_mirror(m.clone()));
+        let block: Vec<&str> = lines.iter().skip(1).map(String::as_str).collect();
+        assert_eq!(
+            block,
+            vec![
+                "Amazon mirror: on, 12 current, 1 pending, last scan 1s ago",
+                "last scan failed: Kindle catalog: locked",
+                "Notebook 0: format not supported",
+                "Notebook 1: format not supported",
+                "Notebook 2: format not supported",
+                "Notebook 3: format not supported",
+                "Notebook 4: format not supported",
+                "...and 1 more",
+            ]
+        );
+        // Every phase and the full mirror block still render inside the framebuffer.
+        let g = panel_geo();
+        let mut fb = vec![0x55; g.smem_len as usize];
+        render_tools(&mut fb, &g, &with_mirror(m)).unwrap();
+    }
+
+    #[test]
+    fn rescan_now_is_offered_only_while_the_mirror_is_on() {
+        let g = panel_geo();
+        let on = with_mirror(mirror(true, None));
+        let l = ToolsLayout::new(&g, &on);
+        let (r, label, hit) = l.rescan.as_ref().unwrap();
+        assert_eq!(
+            (label.as_str(), *hit),
+            ("RESCAN NOW", ToolsHit::MirrorRescan)
+        );
+        let (x, y) = center(*r);
+        assert_eq!(l.hit(x, y, &on), Some(ToolsHit::MirrorRescan));
+        // The import buttons still resolve.
+        let (x, y) = center(l.primary.as_ref().unwrap().0);
+        assert_eq!(l.hit(x, y, &on), Some(ToolsHit::Scan));
+        let off = with_mirror(mirror(false, None));
+        assert!(ToolsLayout::new(&g, &off).rescan.is_none());
+        let busy = ToolsState {
+            phase: ToolsPhase::Importing {
+                done: 0,
+                total: 2,
+                current: "Journal".into(),
+            },
+            mirror: mirror(true, None),
+        };
+        assert!(ToolsLayout::new(&g, &busy).rescan.is_none());
     }
 }
