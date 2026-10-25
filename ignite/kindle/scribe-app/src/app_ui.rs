@@ -1208,10 +1208,23 @@ mod tests {
             mirror: true,
         };
         let spec = dialog_spec(&menu).unwrap();
-        assert!(spec
-            .buttons
-            .iter()
-            .any(|b| b.id == ButtonId::CopyToIgnite && b.label == "COPY TO IGNITE"));
+        let labels = |s: &crate::modal::DialogSpec| {
+            s.buttons
+                .iter()
+                .map(|b| b.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&spec), ["COPY TO IGNITE", "DELETE", "CANCEL"]);
+        let in_folder = Modal::CardMenuInFolder {
+            notebook_id: "m1".into(),
+            title: "Kindle".into(),
+            folder_id: "amazon".into(),
+            mirror: true,
+        };
+        assert_eq!(
+            labels(&dialog_spec(&in_folder).unwrap()),
+            ["COPY TO IGNITE", "DELETE", "CANCEL"]
+        );
         let r = DialogLayout::new(&g, &spec)
             .buttons
             .iter()
@@ -1235,12 +1248,39 @@ mod tests {
             folder_id: "f".into(),
             mirror: false,
         };
-        assert!(!dialog_spec(&plain)
-            .unwrap()
-            .buttons
-            .iter()
-            .any(|b| b.id == ButtonId::CopyToIgnite));
+        assert_eq!(
+            labels(&dialog_spec(&plain).unwrap()),
+            [
+                "RENAME",
+                "CHANGE FOLDER",
+                "REMOVE FROM FOLDER",
+                "DELETE",
+                "CANCEL"
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_read_only_and_already_copied_are_notices_not_errors() {
+        let ro = Modal::read_only_mirror_notice();
+        let spec = dialog_spec(&ro).unwrap();
+        assert_eq!(spec.heading, "Read-only mirror");
+        assert_eq!(spec.body, [crate::modal::READ_ONLY_HINT]);
+        let laid = DialogLayout::new(&crate::ui_gfx::panel_geo(), &spec);
+        let text: Vec<&str> = laid.body.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            text.join(" "),
+            crate::modal::READ_ONLY_HINT,
+            "wrapped, not truncated"
+        );
+        let done = Modal::already_copied_notice();
+        assert!(matches!(&done, Modal::Notice { heading, body }
+            if heading == "Already copied"
+                && body == &["This Kindle notebook already has a copy in Ignite."]));
+        let mut ui = UiState::launch_home(0, 1);
+        ui.show_modal(ro);
+        assert!(matches!(ui.modal, Some(Modal::Notice { .. })));
     }
 
     fn fs_mirror(root: &std::path::Path, id: &str) {

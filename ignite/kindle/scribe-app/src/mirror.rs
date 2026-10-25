@@ -1028,6 +1028,22 @@ pub struct MirrorClock {
     pub last_batches: u64,
 }
 
+/// Apply the Preferences toggle to the scheduler. Off drops any in-progress run (each step is
+/// durable in the ledger, so a later run resumes); on clears the clock so a scan runs at the
+/// next structural safe point. Returns true when a run was cancelled.
+pub fn apply_mirror_toggle(
+    enabled: bool,
+    run: &mut Option<MirrorRun>,
+    clock: &mut MirrorClock,
+) -> bool {
+    if enabled {
+        clock.last_scan = None;
+        false
+    } else {
+        run.take().is_some()
+    }
+}
+
 /// Rescan this often even when no upload batch completed.
 pub const IDLE_RESCAN: Duration = Duration::from_secs(15 * 60);
 

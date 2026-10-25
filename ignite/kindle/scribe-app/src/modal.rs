@@ -16,6 +16,10 @@ const BUTTON_H: u32 = 170;
 const BUTTON_GAP: u32 = 30;
 const BUTTON_SCALE: u32 = 8;
 
+/// Body of the notice shown when a mirror notebook refuses an edit.
+pub const READ_ONLY_HINT: &str =
+    "This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TitlePurpose {
     Create,
@@ -140,6 +144,22 @@ impl Modal {
         }
     }
 
+    /// A pen or command touched a read-only Amazon mirror.
+    pub fn read_only_mirror_notice() -> Self {
+        Self::Notice {
+            heading: "Read-only mirror".into(),
+            body: vec![READ_ONLY_HINT.into()],
+        }
+    }
+
+    /// COPY TO IGNITE on a mirror whose Kindle source was already imported.
+    pub fn already_copied_notice() -> Self {
+        Self::Notice {
+            heading: "Already copied".into(),
+            body: vec!["This Kindle notebook already has a copy in Ignite.".into()],
+        }
+    }
+
     pub fn no_folders_notice() -> Self {
         Self::Notice {
             heading: "No folders yet".into(),
@@ -212,13 +232,18 @@ fn button(id: ButtonId, label: &str) -> DialogButton {
     }
 }
 
-/// A mirror notebook's menu leads with COPY TO IGNITE.
+/// A mirror notebook's menu offers only COPY TO IGNITE, DELETE and CANCEL: renaming or
+/// moving a mirror would be undone by the next rebuild (a deleted mirror is recreated at the
+/// next source change).
 fn card_menu_buttons(mirror: bool, rest: Vec<DialogButton>) -> Vec<DialogButton> {
     if !mirror {
         return rest;
     }
     let mut buttons = vec![button(ButtonId::CopyToIgnite, "COPY TO IGNITE")];
-    buttons.extend(rest);
+    buttons.extend(
+        rest.into_iter()
+            .filter(|b| matches!(b.id, ButtonId::DeleteNotebook | ButtonId::Cancel)),
+    );
     buttons
 }
 

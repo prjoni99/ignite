@@ -312,6 +312,28 @@ fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
 }
 
 #[test]
+fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
+    let mut run = Some(MirrorRun {
+        queue: VecDeque::from([MirrorAction::Remove {
+            origin_id: ID_A.into(),
+        }]),
+        done: 0,
+        failed: Vec::new(),
+    });
+    let mut clock = MirrorClock {
+        last_scan: Some(Instant::now()),
+        last_batches: 3,
+    };
+    assert!(apply_mirror_toggle(false, &mut run, &mut clock));
+    assert!(run.is_none());
+    assert!(clock.last_scan.is_some(), "off leaves the clock alone");
+    assert!(!apply_mirror_toggle(false, &mut run, &mut clock));
+    assert!(!apply_mirror_toggle(true, &mut run, &mut clock));
+    assert!(clock.last_scan.is_none());
+    assert!(scan_due(&clock, Instant::now(), 3));
+}
+
+#[test]
 fn rebuilding_and_stampless_unsupported_sources_that_are_present_rebuild() {
     let k = Kindle::new();
     k.add_synthetic(ID_A, "Half");

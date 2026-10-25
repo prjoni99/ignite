@@ -2374,10 +2374,6 @@ fn import_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
     present_ui(x, ctrl, None)
 }
 
-/// One-line modal shown the first time a pen touches a mirror notebook page after it opens.
-const READ_ONLY_HINT: &str =
-    "This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.";
-
 /// The notebook in `dir` is an Amazon mirror (read-only on the page).
 fn is_mirror_notebook_dir(dir: &Path) -> bool {
     dir.join(crate::mirror::MIRROR_MARKER).is_file()
@@ -2470,7 +2466,7 @@ fn copy_mirror(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl, notebook_id: &str) -> 
         }
         ImportOutcome::AlreadyImported => {
             println!("copy_mirror_skipped mirror={notebook_id} origin={origin_id} reason=already_imported");
-            x.ui.show_error("Already copied to Ignite.");
+            x.ui.show_modal(Modal::already_copied_notice());
         }
         ImportOutcome::Failed(e) | ImportOutcome::Halted(e) => {
             eprintln!(
@@ -3340,7 +3336,7 @@ fn execute_ui_command(
             if *notebook_id != x.manifest.notebook_id)
     {
         println!("mirror_read_only_refused command={cmd:?}");
-        x.ui.show_error(READ_ONLY_HINT);
+        x.ui.show_modal(Modal::read_only_mirror_notice());
         return present_ui(x, ctrl, None);
     }
     match cmd {
@@ -3371,6 +3367,9 @@ fn execute_ui_command(
                 Ok(()) => {
                     x.ui.mirror_enabled = enabled;
                     println!("mirror_amazon_enabled={enabled}");
+                    if crate::mirror::apply_mirror_toggle(enabled, x.mirror_run, x.mirror_clock) {
+                        println!("mirror_run_cancelled reason=disabled");
+                    }
                 }
                 Err(e) => {
                     eprintln!("preferences_save_failed detail={e}");
@@ -4517,7 +4516,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
         {
             read_only_hint_due = false;
             read_only_hint_shown = true;
-            ui.show_error(READ_ONLY_HINT);
+            // Shown the first time a pen touches a mirror notebook page after it opens.
+            ui.show_modal(Modal::read_only_mirror_notice());
             ui.note_modal_transition(false, ms_since_start(Instant::now()));
             println!("mirror_read_only_hint notebook={}", manifest.notebook_id);
             if let Err(e) =
