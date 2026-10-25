@@ -2374,213 +2374,14 @@ fn import_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
     present_ui(x, ctrl, None)
 }
 
+/// Amazon mirror glue at the structural safe point (scan, step, recovery, Copy to Ignite,
+/// Tools refresh). A child module so it reaches this file's private `UiExec`/`present_ui`.
+#[path = "mirror_ui.rs"]
+mod mirror_ui;
+
 /// The notebook in `dir` is an Amazon mirror (read-only on the page).
 fn is_mirror_notebook_dir(dir: &Path) -> bool {
     dir.join(crate::mirror::MIRROR_MARKER).is_file()
-}
-
-/// Refresh the Tools screen's mirror block from the ledger (no Kindle file is touched).
-fn refresh_tools_mirror(
-    ui: &mut UiState,
-    library_root: &Path,
-    run: Option<&crate::mirror::MirrorRun>,
-    clock: &crate::mirror::MirrorClock,
-) {
-    let live = crate::mirror::MirrorLive {
-        enabled: ui.mirror_enabled,
-        sync_linked: crate::sync_outbound::with_global(|_| ()).is_some(),
-        queued: run.map_or(0, |r| r.queue.len()),
-        skipped: clock.last_skipped,
-        last_scan_unix_ms: clock.last_scan_unix_ms,
-    };
-    let now = crate::mirror::unix_now_ms();
-    ui.tools.mirror = match crate::mirror::MirrorLedger::open(library_root) {
-        Ok(ledger) => crate::mirror::summary(&ledger, live, now),
-        Err(e) => {
-            eprintln!("mirror_summary_failed detail={e}");
-            crate::mirror::MirrorSummary {
-                enabled: live.enabled,
-                sync_linked: live.sync_linked,
-                skipped: live.skipped,
-                pending: live.queued,
-                last_scan_error: Some(e),
-                now_unix_ms: now,
-                ..Default::default()
-            }
-        }
-    };
-}
-
-/// Home card menu → COPY TO IGNITE: import an editable copy of the mirror's Kindle source
-/// (the regular one-way import, so a second copy is refused as already imported). Runs from
-/// the Home modal at a safe point, never on the pen path; large notebooks take seconds, as
-/// "Import all" does.
-fn copy_mirror(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl, notebook_id: &str) -> Result<(), String> {
-    use crate::nbk_import::{discover, import_one, GlobalSync, ImportOutcome, ImportSources};
-    use crate::nbk_import::{ImportTarget, Ledger};
-    let marker = x
-        .library
-        .notebook_dir(notebook_id)
-        .join(crate::mirror::MIRROR_MARKER);
-    let origin = std::fs::read(&marker)
-        .map_err(|e| format!("read {}: {e}", marker.display()))
-        .and_then(|b| {
-            serde_json::from_slice::<crate::mirror::MirrorOriginV1>(&b)
-                .map_err(|e| format!("unreadable mirror marker {}: {e}", marker.display()))
-        });
-    let origin_id = match origin {
-        Ok(m) => m.origin_id,
-        Err(e) => {
-            eprintln!("copy_mirror_failed notebook={notebook_id} detail={e}");
-            x.ui.show_error("The notebook couldn't be copied.");
-            return present_ui(x, ctrl, None);
-        }
-    };
-    let source = match discover(&ImportSources::kindle()) {
-        Ok(all) => all.into_iter().find(|s| s.origin_id == origin_id),
-        Err(e) => {
-            eprintln!("copy_mirror_failed notebook={notebook_id} origin={origin_id} detail={e}");
-            x.ui.show_error("The notebook couldn't be copied.");
-            return present_ui(x, ctrl, None);
-        }
-    };
-    let Some(source) = source else {
-        println!("copy_mirror_missing notebook={notebook_id} origin={origin_id}");
-        x.ui.show_error("That Kindle notebook is no longer on this device.");
-        return present_ui(x, ctrl, None);
-    };
-    let paper = paper_background(&x.geo);
-    let t0 = Instant::now();
-    let outcome = match Ledger::open(x.library.root()) {
-        Ok(mut ledger) => {
-            let mut target = ImportTarget {
-                library: &mut *x.library,
-                profile: &*x.notebook_profile,
-                geo: &x.geo,
-                paper: &paper,
-                cancel: x.stop,
-            };
-            import_one(&mut target, &mut ledger, &source, &GlobalSync)
-        }
-        Err(e) => ImportOutcome::Failed(e),
-    };
-    let ms = t0.elapsed().as_millis();
-    match outcome {
-        ImportOutcome::Imported {
-            notebook_id: copy,
-            pages,
-            ..
-        } => {
-            println!("copy_mirror_done mirror={notebook_id} origin={origin_id} notebook={copy} pages={pages} ms={ms}");
-        }
-        ImportOutcome::AlreadyImported => {
-            println!("copy_mirror_skipped mirror={notebook_id} origin={origin_id} reason=already_imported");
-            x.ui.show_modal(Modal::already_copied_notice());
-        }
-        ImportOutcome::Failed(e) | ImportOutcome::Halted(e) => {
-            eprintln!(
-                "copy_mirror_failed notebook={notebook_id} origin={origin_id} ms={ms} detail={e}"
-            );
-            x.ui.show_error("The notebook couldn't be copied.");
-        }
-    }
-    present_ui(x, ctrl, None)
-}
-
-/// Apply the next queued Amazon mirror action. Runs only at the structural safe point and only
-/// where [`crate::mirror::step_allowed`] admits it (Home/Tools), never with a page open.
-fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
-    use crate::mirror::{apply_one, kindle_decode, MirrorLedger, MirrorOutcome, MirrorTarget};
-    use crate::nbk_import::{GlobalSync, ImportTarget};
-    let Some(run) = x.mirror_run.as_mut() else {
-        return Ok(());
-    };
-    let Some(action) = run.queue.pop_front() else {
-        *x.mirror_run = None;
-        return Ok(());
-    };
-    let paper = paper_background(&x.geo);
-    let t0 = Instant::now();
-    let outcome = match MirrorLedger::open(x.library.root()) {
-        Ok(mut ledger) => {
-            let mut target = MirrorTarget {
-                import: ImportTarget {
-                    library: &mut *x.library,
-                    profile: &*x.notebook_profile,
-                    geo: &x.geo,
-                    paper: &paper,
-                    cancel: x.stop,
-                },
-                folders: &mut *x.folders,
-            };
-            apply_one(
-                &mut target,
-                &mut ledger,
-                &action,
-                &kindle_decode,
-                &GlobalSync,
-            )
-        }
-        // An unreadable ledger fails closed for every action: stop the run.
-        Err(e) => MirrorOutcome::Halted(e),
-    };
-    let ms = t0.elapsed().as_millis();
-    let (label, detail) = match &outcome {
-        MirrorOutcome::Done => ("done", ""),
-        MirrorOutcome::Skipped(m) => ("skipped", m.as_str()),
-        MirrorOutcome::Failed(m) => ("failed", m.as_str()),
-        MirrorOutcome::Halted(m) => ("halted", m.as_str()),
-    };
-    println!(
-        "mirror_step action={} origin={} outcome={label} ms={ms} detail={detail}",
-        action.kind(),
-        action.origin_id()
-    );
-    let finished = match outcome {
-        MirrorOutcome::Done => {
-            run.done += 1;
-            run.queue.is_empty()
-        }
-        MirrorOutcome::Skipped(_) => run.queue.is_empty(),
-        MirrorOutcome::Failed(m) => {
-            run.failed.push((action.origin_id().to_string(), m));
-            run.queue.is_empty()
-        }
-        MirrorOutcome::Halted(_) => {
-            println!(
-                "mirror_run_halted done={} failed={} not_started={}",
-                run.done,
-                run.failed.len(),
-                run.queue.len()
-            );
-            *x.mirror_run = None;
-            if x.ui.view == AppView::Tools && !x.ui.modal_open() {
-                refresh_tools_mirror(x.ui, x.library.root(), None, x.mirror_clock);
-                return present_ui(x, ctrl, None);
-            }
-            return Ok(());
-        }
-    };
-    if finished {
-        let done = run.done;
-        println!("mirror_run_done done={done} failed={}", run.failed.len());
-        *x.mirror_run = None;
-        // Home lists notebooks and folders: show the mirrored result once, not per action.
-        if done > 0 && x.ui.view == AppView::Home && !x.ui.modal_open() {
-            return present_ui(x, ctrl, None);
-        }
-    }
-    // Tools shows the mirror's progress: refresh it after every step.
-    if x.ui.view == AppView::Tools && !x.ui.modal_open() {
-        refresh_tools_mirror(
-            x.ui,
-            x.library.root(),
-            x.mirror_run.as_ref(),
-            x.mirror_clock,
-        );
-        return present_ui(x, ctrl, None);
-    }
-    Ok(())
 }
 
 /// Kindle home (Library) app. appmgrd switching to it pauses/unloads `com.markrai.ignite`;
@@ -3359,7 +3160,7 @@ fn execute_ui_command(
         UiCommand::Redraw(Redraw::Region(r)) => present_ui(x, ctrl, Some(r)),
         UiCommand::OpenTools => {
             x.ui.enter_tools();
-            refresh_tools_mirror(
+            mirror_ui::refresh_tools(
                 x.ui,
                 x.library.root(),
                 x.mirror_run.as_ref(),
@@ -3370,7 +3171,7 @@ fn execute_ui_command(
         }
         UiCommand::ShowToolsTab => {
             x.ui.show_tools_tab();
-            refresh_tools_mirror(
+            mirror_ui::refresh_tools(
                 x.ui,
                 x.library.root(),
                 x.mirror_run.as_ref(),
@@ -3383,7 +3184,7 @@ fn execute_ui_command(
             // The scan itself runs at the next structural safe point (same gate as always).
             x.mirror_clock.last_scan = None;
             println!("mirror_rescan_requested=true");
-            refresh_tools_mirror(
+            mirror_ui::refresh_tools(
                 x.ui,
                 x.library.root(),
                 x.mirror_run.as_ref(),
@@ -3407,7 +3208,7 @@ fn execute_ui_command(
             }
             present_ui(x, ctrl, None)
         }
-        UiCommand::CopyMirror(notebook_id) => copy_mirror(x, ctrl, &notebook_id),
+        UiCommand::CopyMirror(notebook_id) => mirror_ui::copy(x, ctrl, &notebook_id),
         UiCommand::OpenPreferences => {
             x.ui.enter_preferences();
             println!("app_view=preferences");
@@ -4568,16 +4369,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                 crate::sync_outbound::with_global(|_| ()).is_some(),
             )
         {
-            mirror_clock.recovery_done = true;
-            if crate::mirror::MirrorLedger::path_for(library.root()).exists() {
-                match crate::mirror::recover_interrupted(
-                    &mut library,
-                    &crate::nbk_import::GlobalSync,
-                ) {
-                    Ok(n) => println!("mirror_recovered count={n}"),
-                    Err(e) => eprintln!("mirror_recovery_failed detail={e}"),
-                }
-            }
+            mirror_ui::recover(&mut library, &mut mirror_clock);
             continue;
         }
         if structure_eligible
@@ -4601,50 +4393,14 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                 let batches = crate::sync_outbound::with_global(|s| s.stats().batches).unwrap_or(0);
                 let now = Instant::now();
                 if crate::mirror::scan_due(&mirror_clock, now, batches) {
-                    mirror_clock.last_scan = Some(now);
-                    mirror_clock.last_batches = batches;
-                    mirror_clock.last_scan_unix_ms = Some(crate::mirror::unix_now_ms());
-                    match crate::mirror::MirrorLedger::open(library.root()) {
-                        Ok(mut ledger) => match crate::mirror::scan(
-                            &crate::nbk_import::ImportSources::kindle(),
-                            &ledger,
-                        ) {
-                            Ok(r) => {
-                                println!(
-                                    "mirror_scan actions={} current={} unsupported={} skipped={}",
-                                    r.actions.len(),
-                                    r.current,
-                                    r.unsupported.len(),
-                                    r.skipped
-                                );
-                                mirror_clock.last_skipped = r.skipped;
-                                if !r.actions.is_empty() {
-                                    mirror_run = Some(crate::mirror::MirrorRun {
-                                        queue: r.actions.into(),
-                                        done: 0,
-                                        failed: vec![],
-                                    });
-                                }
-                                if let Err(e) = ledger.note_scan(None) {
-                                    eprintln!("mirror_scan_note_failed detail={e}");
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("mirror_scan_failed detail={e}");
-                                if let Err(w) = ledger.note_scan(Some(e)) {
-                                    eprintln!("mirror_scan_note_failed detail={w}");
-                                }
-                            }
-                        },
-                        Err(e) => eprintln!("mirror_scan_failed detail={e}"),
-                    }
-                    if ui.view == AppView::Tools {
-                        refresh_tools_mirror(
-                            &mut ui,
-                            library.root(),
-                            mirror_run.as_ref(),
-                            &mirror_clock,
-                        );
+                    if mirror_ui::scan(
+                        &mut ui,
+                        &library,
+                        &mut mirror_run,
+                        &mut mirror_clock,
+                        now,
+                        batches,
+                    ) {
                         pending_ui = Some(UiCommand::Redraw(Redraw::Full));
                     }
                     continue;
@@ -4654,7 +4410,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
             if mirror_run.is_some()
                 && crate::mirror::step_allowed(ui.view, import_run.is_some(), sync_linked)
             {
-                if let Err(e) = mirror_step(&mut ui_exec!(), &mut ctrl) {
+                if let Err(e) = mirror_ui::step(&mut ui_exec!(), &mut ctrl) {
                     eprintln!("error: mirror present: {e}");
                     let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
                     shutdown_safe = safe;
