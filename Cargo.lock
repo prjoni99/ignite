@@ -777,6 +777,7 @@ name = "page-templates"
 version = "0.9.14"
 dependencies = [
  "serde",
+ "serde_json",
  "sha2",
 ]
 

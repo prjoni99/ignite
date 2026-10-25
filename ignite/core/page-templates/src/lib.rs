@@ -36,7 +36,7 @@ pub struct Builtin {
 
 pub const BUILTINS: &[Builtin] = &[
     Builtin { id: "blank", name: "Blank", spec: TemplateSpec::Blank },
-    Builtin { id: "lined", name: "Lined", spec: TemplateSpec::Lined { spacing_px: 94, margin_px: 160 } },
+    Builtin { id: "lined", name: "Lined", spec: TemplateSpec::Lined { spacing_px: LINED_SPACING, margin_px: LINED_MARGIN } },
     Builtin { id: "dot_grid", name: "Dot grid", spec: TemplateSpec::DotGrid { pitch_px: 60 } },
     Builtin { id: "graph", name: "Graph", spec: TemplateSpec::Graph { pitch_px: 60 } },
     Builtin { id: "cornell", name: "Cornell", spec: TemplateSpec::Cornell },
@@ -54,6 +54,7 @@ const DAILY_HEADER: u32 = 300;
 const WEEK_BANDS: u32 = 7;
 const STAFF_LINE_GAP: u32 = 24;
 const STAFF_GROUP_PITCH: u32 = 260;
+const STAFF_MARGIN: u32 = 80;
 
 struct Canvas {
     px: Vec<u8>,
@@ -86,7 +87,7 @@ impl Canvas {
         let end = self.h.saturating_sub(SAFE_BOTTOM);
         let x1 = self.w.saturating_sub(margin);
         let mut y = from_y;
-        while y < end {
+        while y.saturating_add(2) <= end {
             self.hline(y, margin, x1, 2, LINE);
             y = y.saturating_add(spacing);
         }
@@ -108,8 +109,8 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
                 while y < bottom {
                     let mut x = pitch_px;
                     while x < w {
-                        c.rect(x, x + 2, y, y + 2, DOT);
-                        x += pitch_px;
+                        c.rect(x, x.saturating_add(2), y, y.saturating_add(2), DOT);
+                        x = x.saturating_add(pitch_px);
                     }
                     y = y.saturating_add(pitch_px);
                 }
@@ -125,7 +126,7 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
                 let mut x = pitch_px;
                 while x < w {
                     c.vline(x, top, bottom, 1, LINE);
-                    x += pitch_px;
+                    x = x.saturating_add(pitch_px);
                 }
             }
         }
@@ -148,17 +149,17 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
         TemplateSpec::Isometric { pitch_px } => {
             if pitch_px > 0 {
                 // Triangular lattice: row height is ~0.866 * pitch, odd rows offset by half a pitch.
-                let row_h = (pitch_px * 7 / 8).max(1);
-                let mut y = top + row_h;
+                let row_h = (pitch_px - pitch_px / 8).max(1);
+                let mut y = top.saturating_add(row_h);
                 let mut odd = false;
                 while y < bottom {
                     let mut x = if odd { pitch_px / 2 } else { 0 };
                     while x < w {
-                        c.rect(x, x + 2, y, y + 2, DOT);
-                        x += pitch_px;
+                        c.rect(x, x.saturating_add(2), y, y.saturating_add(2), DOT);
+                        x = x.saturating_add(pitch_px);
                     }
                     odd = !odd;
-                    y += row_h;
+                    y = y.saturating_add(row_h);
                 }
             }
         }
@@ -166,7 +167,7 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
             let mut g = top + STAFF_GROUP_PITCH / 2;
             while g + 4 * STAFF_LINE_GAP < bottom {
                 for i in 0..5 {
-                    c.hline(g + i * STAFF_LINE_GAP, LINED_MARGIN / 2, w.saturating_sub(LINED_MARGIN / 2), 1, LINE);
+                    c.hline(g + i * STAFF_LINE_GAP, STAFF_MARGIN, w.saturating_sub(STAFF_MARGIN), 1, LINE);
                 }
                 g += STAFF_GROUP_PITCH;
             }
@@ -179,18 +180,23 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
 }
 
 /// Box-average `factor x factor` blocks (round to nearest); output `(w/factor) * (h/factor)`.
+/// If `bitmap` is shorter than `w * h`, returns an all-white thumbnail of the expected size
+/// instead of panicking.
 pub fn thumbnail(bitmap: &[u8], w: u32, h: u32, factor: u32) -> Vec<u8> {
     if factor == 0 {
         return Vec::new();
     }
     let (tw, th) = (w / factor, h / factor);
-    let n = (factor * factor) as u64;
-    let mut out = Vec::with_capacity((tw * th) as usize);
+    let n = factor as u64 * factor as u64;
+    if (bitmap.len() as u64) < w as u64 * h as u64 {
+        return vec![WHITE; tw as usize * th as usize];
+    }
+    let mut out = Vec::with_capacity(tw as usize * th as usize);
     for ty in 0..th {
         for tx in 0..tw {
             let mut sum = 0u64;
             for dy in 0..factor {
-                let row = ((ty * factor + dy) * w + tx * factor) as usize;
+                let row = ((ty * factor + dy) as usize) * w as usize + (tx * factor) as usize;
                 sum += bitmap[row..row + factor as usize].iter().map(|&v| v as u64).sum::<u64>();
             }
             out.push(((sum + n / 2) / n) as u8);
