@@ -2247,6 +2247,9 @@ struct UiExec<'a> {
     on_inbox: &'a mut bool,
     /// Where a capture returns to (one deep; cleared on every way out of the Inbox).
     return_slot: &'a mut Option<crate::capture::ReturnSlot>,
+    /// (notebook id, page id) of the page the current capture opened: the only page the
+    /// empty-capture discard may delete (cleared on every way out).
+    capture_page: &'a mut Option<(String, String)>,
 }
 
 /// One "Import all" run: the eligible sources still to import plus running totals.
@@ -3187,6 +3190,7 @@ fn note_inbox_binding(x: &mut UiExec<'_>) {
     *x.on_inbox = crate::capture::is_inbox(x.library.root(), &x.manifest.notebook_id);
     if !*x.on_inbox {
         *x.return_slot = None;
+        *x.capture_page = None;
     }
 }
 
@@ -3195,33 +3199,59 @@ fn on_capture_page(x: &UiExec<'_>, ctrl: &KindleCtrl) -> bool {
     *x.on_inbox && x.ui.view == AppView::Notebook && ctrl.store().is_bound()
 }
 
-/// Discard the current Inbox page if it has no ink and is not the notebook's only page,
-/// through the normal page-delete path (sync ticket, successor bind).
+/// The capture is over: clear its page and, when the view is the very page it opened, discard
+/// that page if it was left untouched (no stroke ever, no link, no text beyond its stamp;
+/// never the only page), through the normal page-delete path (sync ticket, successor bind).
+/// A refused or failed delete keeps the page and never stops the navigation; only a
+/// post-commit `FATAL:` (the page is already gone) is propagated.
 fn discard_empty_capture(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
-    let strokes = ctrl.store().stroke_count();
-    let pages = x.manifest.page_ids.len();
-    if !crate::capture::should_discard_on_leave(strokes, pages) {
+    let current = (x.ui.view == AppView::Notebook && ctrl.store().is_bound()).then(|| {
+        (
+            x.manifest.notebook_id.clone(),
+            ctrl.session.page_id().to_string(),
+        )
+    });
+    let current = current.as_ref().map(|(n, p)| (n.as_str(), p.as_str()));
+    if !crate::capture::leaving(x.capture_page, current) {
         return Ok(());
     }
     let page = ctrl.session.page_id().to_string();
-    let deleted = delete_current_page(
+    let texts = match crate::store::load_page_texts(&page_dir(x.notebook_dir, &page)) {
+        Ok(t) => t.len(),
+        Err(e) => {
+            eprintln!("capture_discard_failed page={page} detail={e}");
+            return Ok(());
+        }
+    };
+    if !crate::capture::should_discard_on_leave(
+        ctrl.store().stroke_count(),
+        x.manifest.page_ids.len(),
+        ctrl.links().len(),
+        texts,
+    ) {
+        return Ok(());
+    }
+    match delete_current_page(
         x.notebook_dir,
         x.manifest,
         ctrl,
         x.notebook_profile,
         x.current_bg,
-    )?;
-    println!("capture_discarded page={page} deleted={deleted}");
+    ) {
+        Ok(deleted) => println!("capture_discarded page={page} deleted={deleted}"),
+        Err(e) if e.starts_with("FATAL:") => return Err(e),
+        Err(e) => eprintln!("capture_discard_failed page={page} detail={e}"),
+    }
     Ok(())
 }
 
 /// Leaving an Inbox page other than by the side button (Home, another notebook, Today, a new
-/// capture): the empty-page rule applies once and the capture is over.
+/// capture, Tools/Preferences/Sync, exit): the discard rule applies once and the capture is
+/// over.
 fn leave_capture_page_if_empty(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
-    if !on_capture_page(x, ctrl) {
-        return Ok(());
+    if on_capture_page(x, ctrl) {
+        *x.return_slot = None;
     }
-    *x.return_slot = None;
     discard_empty_capture(x, ctrl)
 }
 
@@ -3333,7 +3363,14 @@ fn run_capture(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
                 "capture_open notebook={notebook_id} page={page_id} created={created} return={}",
                 x.return_slot.is_some()
             );
-            show_daily_page(x, ctrl, &notebook_id, &page_id)
+            show_daily_page(x, ctrl, &notebook_id, &page_id)?;
+            // Only once the page is actually showing (an open failure shows its error).
+            let showing = x.ui.view == AppView::Notebook
+                && ctrl.store().is_bound()
+                && x.manifest.notebook_id == notebook_id
+                && ctrl.session.page_id() == page_id;
+            *x.capture_page = showing.then_some((notebook_id, page_id));
+            Ok(())
         }
         Err(e) => {
             eprintln!("capture_failed detail={e}");
@@ -3673,6 +3710,7 @@ fn execute_ui_command(
         UiCommand::Redraw(Redraw::Full) => present_ui(x, ctrl, None),
         UiCommand::Redraw(Redraw::Region(r)) => present_ui(x, ctrl, Some(r)),
         UiCommand::OpenTools => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_tools();
             mirror_ui::refresh_tools(
                 x.ui,
@@ -3724,6 +3762,7 @@ fn execute_ui_command(
         }
         UiCommand::CopyMirror(notebook_id) => mirror_ui::copy(x, ctrl, &notebook_id),
         UiCommand::OpenPreferences => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_preferences();
             println!("app_view=preferences");
             present_ui(x, ctrl, None)
@@ -3805,6 +3844,7 @@ fn execute_ui_command(
             present_ui(x, ctrl, None)
         }
         UiCommand::OpenSync => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_sync();
             crate::server_link::with_global(|l| {
                 l.send(crate::server_link::LinkCmd::EnterSyncScreen)
@@ -3862,7 +3902,10 @@ fn execute_ui_command(
             leave_capture_page_if_empty(x, ctrl)?;
             go_home(x, ctrl)
         }
-        UiCommand::ExitApp => request_app_exit(x, ctrl),
+        UiCommand::ExitApp => {
+            leave_capture_page_if_empty(x, ctrl)?;
+            request_app_exit(x, ctrl)
+        }
         UiCommand::OpenNotebook(id) => {
             leave_capture_page_if_empty(x, ctrl)?;
             open_notebook_from_ui(x, ctrl, &id)
@@ -4554,6 +4597,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     // Launch is unbound: not on the Inbox, nothing to return to.
     let mut on_inbox = false;
     let mut return_slot: Option<crate::capture::ReturnSlot> = None;
+    let mut capture_page: Option<(String, String)> = None;
     let mut read_only_hint_shown = false;
     let mut read_only_hint_due = false;
     let mut input_lag = crate::input_lag::InputLag::default();
@@ -4689,6 +4733,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     last_move_undo: &mut last_move_undo,
                     on_inbox: &mut on_inbox,
                     return_slot: &mut return_slot,
+                    capture_page: &mut capture_page,
                 }
             };
         }

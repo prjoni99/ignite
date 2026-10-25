@@ -345,8 +345,9 @@ mod tests {
             crate::capture::capture_command_for(false),
             crate::app_ui::UiCommand::Capture
         );
-        assert!(crate::capture::should_discard_on_leave(0, 2));
-        assert!(!crate::capture::should_discard_on_leave(0, 1));
-        assert!(!crate::capture::should_discard_on_leave(3, 2));
+        assert!(crate::capture::should_discard_on_leave(0, 2, 0, 1));
+        assert!(!crate::capture::should_discard_on_leave(0, 1, 0, 1));
+        assert!(!crate::capture::should_discard_on_leave(3, 2, 0, 1));
+        assert!(!crate::capture::should_discard_on_leave(0, 2, 1, 1));
     }
 }

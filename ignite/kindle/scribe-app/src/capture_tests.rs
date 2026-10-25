@@ -9,7 +9,7 @@ use crate::nbk_test_kit::{geo, Scribe};
 use crate::notebook::{
     delete_page_durable, insert_page_after_durable, DeletePageHooks, InsertPageHooks,
 };
-use crate::store::{load_page_texts, page_dir, DEFAULT_PAGE_ID};
+use crate::store::{load_page_links, load_page_texts, page_dir, write_page_links, DEFAULT_PAGE_ID};
 use std::cell::Cell;
 
 fn at(hour: u32, minute: u32) -> LocalDateTime {
@@ -180,21 +180,40 @@ fn corrupt_capture_ledger_fails_closed() {
     }
 }
 
+/// The runtime's discard gate, read from disk: (ever strokes, pages, links, texts).
+fn discardable(s: &Scribe, nb: &str, page: &str) -> bool {
+    let dir = s.lib.notebook_dir(nb);
+    let pd = page_dir(&dir, page);
+    // No test page here ever received a stroke; the runtime passes the store's count.
+    let strokes = crate::store::load_page_read_only(&dir, page)
+        .unwrap()
+        .strokes
+        .len();
+    should_discard_on_leave(
+        strokes,
+        page_ids(s, nb).len(),
+        load_page_links(&pd).unwrap().len(),
+        load_page_texts(&pd).unwrap().len(),
+    )
+}
+
 #[test]
 fn empty_capture_is_discarded_on_leave_but_the_only_page_stays() {
-    // (strokes, pages) → discard?
-    for (strokes, pages, discard) in [
-        (0, 2, true),
-        (0, 9, true),
-        (0, 1, false),
-        (0, 0, false),
-        (1, 2, false),
-        (5, 1, false),
+    // (ever strokes, pages, links, texts) → discard?
+    for (strokes, pages, links, texts, discard) in [
+        (0, 2, 0, 1, true),
+        (0, 9, 0, 0, true),
+        (0, 1, 0, 1, false),
+        (0, 0, 0, 0, false),
+        (1, 2, 0, 1, false),
+        (5, 1, 0, 1, false),
+        (0, 2, 1, 1, false),
+        (0, 2, 0, 2, false),
     ] {
         assert_eq!(
-            should_discard_on_leave(strokes, pages),
+            should_discard_on_leave(strokes, pages, links, texts),
             discard,
-            "strokes={strokes} pages={pages}"
+            "strokes={strokes} pages={pages} links={links} texts={texts}"
         );
     }
     // On disk the only page can never be deleted, whatever the rule says.
@@ -203,17 +222,70 @@ fn empty_capture_is_discarded_on_leave_but_the_only_page_stays() {
     let mut ledger = CaptureLedger::open(&root).unwrap();
     let n = Cell::new(0);
     let (nb, page, _) = capture(&mut s, &mut ledger, &at(9, 30), &n);
+    assert!(!discardable(&s, &nb, &page), "only page");
     let dir = s.lib.notebook_dir(&nb);
     let mut m = read_notebook_manifest_read_only(&dir).unwrap();
     let e = delete_page_durable(&dir, &mut m, &page, &DeletePageHooks::default()).unwrap_err();
     assert!(e.starts_with("REFUSE PAGE DELETE"), "{e}");
     assert_eq!(page_ids(&s, &nb), vec![page.clone()]);
-    // With a second capture the empty one may go.
+    // With a second capture the untouched one may go.
     let (_, p2, _) = capture(&mut s, &mut ledger, &at(9, 31), &n);
+    assert!(discardable(&s, &nb, &p2));
     let mut m = read_notebook_manifest_read_only(&dir).unwrap();
-    assert!(should_discard_on_leave(0, m.page_ids.len()));
     delete_page_durable(&dir, &mut m, &p2, &DeletePageHooks::default()).unwrap();
     assert_eq!(page_ids(&s, &nb), vec![page]);
+}
+
+#[test]
+fn a_capture_with_a_link_or_more_text_is_kept() {
+    let mut s = Scribe::new();
+    let root = s.lib.root().to_path_buf();
+    let mut ledger = CaptureLedger::open(&root).unwrap();
+    let n = Cell::new(0);
+    let (nb, _, _) = capture(&mut s, &mut ledger, &at(9, 30), &n);
+    let dir = s.lib.notebook_dir(&nb);
+    // A second text (e.g. synced in) keeps the page.
+    let (_, texted, _) = capture(&mut s, &mut ledger, &at(9, 31), &n);
+    assert!(discardable(&s, &nb, &texted));
+    crate::text_author::stamp_page(&dir, &nb, &texted, "more").unwrap();
+    assert!(!discardable(&s, &nb, &texted));
+    // A link keeps the page.
+    let (_, linked, _) = capture(&mut s, &mut ledger, &at(9, 32), &n);
+    assert!(discardable(&s, &nb, &linked));
+    use sync_engine::testkit::{lk, nb as snb, pg};
+    let link = sync_protocol::SyncPageLink {
+        link_id: lk(1),
+        source_notebook_id: snb(1),
+        source_page_id: pg(1),
+        source_x: 100.0,
+        source_y: 200.0,
+        target_notebook_id: snb(1),
+        target_page_id: pg(2),
+    };
+    write_page_links(&page_dir(&dir, &linked), &[link]).unwrap();
+    assert!(!discardable(&s, &nb, &linked));
+    // The gate is what the runtime consults before deleting: both pages stay.
+    let ids = page_ids(&s, &nb);
+    assert!(ids.contains(&texted) && ids.contains(&linked));
+}
+
+#[test]
+fn leaving_clears_the_capture_page_and_matches_only_it() {
+    let opened = || Some(("notebook-2".to_string(), "page-3".to_string()));
+    let mut slot = opened();
+    assert!(leaving(&mut slot, Some(("notebook-2", "page-3"))));
+    assert_eq!(slot, None);
+    // Once: a second leave of the same page discards nothing.
+    assert!(!leaving(&mut slot, Some(("notebook-2", "page-3"))));
+    for current in [
+        Some(("notebook-2", "page-4")),
+        Some(("notebook-1", "page-3")),
+        None,
+    ] {
+        let mut slot = opened();
+        assert!(!leaving(&mut slot, current), "{current:?}");
+        assert_eq!(slot, None, "cleared on every way out");
+    }
 }
 
 #[test]

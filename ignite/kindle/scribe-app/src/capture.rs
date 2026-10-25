@@ -114,9 +114,27 @@ pub fn next_capture_page(manifest: &PersistedNotebookManifestV1, created: bool) 
     }
 }
 
-/// An Inbox page left without ink goes away, unless it is the notebook's only page.
-pub fn should_discard_on_leave(page_stroke_count: usize, page_count: usize) -> bool {
-    page_stroke_count == 0 && page_count > 1
+/// The page a capture opened goes away when it is left untouched: no stroke was ever written
+/// on it (`ever_strokes`, the store's stroke ids, so a drawn-then-undone page is kept), it has
+/// no link, and no text beyond the one stamp the capture wrote. The notebook's only page
+/// always stays.
+pub fn should_discard_on_leave(
+    ever_strokes: usize,
+    page_count: usize,
+    link_count: usize,
+    text_count: usize,
+) -> bool {
+    ever_strokes == 0 && page_count > 1 && link_count == 0 && text_count <= 1
+}
+
+/// Leaving the view `current` (notebook id, page id): the capture is over either way (the
+/// slot is cleared); true only when `current` is the very page this capture opened, the
+/// only page the discard rule may touch.
+pub fn leaving(capture_page: &mut Option<(String, String)>, current: Option<(&str, &str)>) -> bool {
+    match (capture_page.take(), current) {
+        (Some((nb, page)), Some((cur_nb, cur_page))) => nb == cur_nb && page == cur_page,
+        _ => false,
+    }
 }
 
 /// The side button's capture gesture: return from an Inbox page, capture from anywhere else.
