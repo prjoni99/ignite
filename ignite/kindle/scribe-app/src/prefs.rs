@@ -29,6 +29,13 @@ pub enum SideButtonAction {
 struct PreferencesFile {
     v: u32,
     side_button: SideButtonAction,
+    /// Mirror Amazon's stock notebooks into the read-only Amazon folder. On by default.
+    #[serde(default = "default_true")]
+    mirror_amazon: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for PreferencesFile {
@@ -36,6 +43,7 @@ impl Default for PreferencesFile {
         Self {
             v: PREFERENCES_VERSION,
             side_button: SideButtonAction::NavigationUndo,
+            mirror_amazon: true,
         }
     }
 }
@@ -76,11 +84,33 @@ fn parse_bytes(raw: &[u8]) -> PreferencesFile {
     file
 }
 
-/// Persist `side_button`.
+/// Persist `side_button`, keeping the other preferences.
 pub fn save_side_button(path: &Path, action: SideButtonAction) -> Result<(), String> {
     let file = PreferencesFile {
-        v: PREFERENCES_VERSION,
         side_button: action,
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+/// Load the Amazon mirror toggle. Missing/unreadable/malformed → on.
+pub fn load_mirror_enabled(path: &Path) -> bool {
+    load(path).mirror_amazon
+}
+
+/// Persist the Amazon mirror toggle, keeping the other preferences.
+pub fn save_mirror_enabled(path: &Path, enabled: bool) -> Result<(), String> {
+    let file = PreferencesFile {
+        mirror_amazon: enabled,
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+fn write(path: &Path, file: &PreferencesFile) -> Result<(), String> {
+    let file = PreferencesFile {
+        v: PREFERENCES_VERSION,
+        ..file.clone()
     };
     let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or(path);
@@ -195,6 +225,24 @@ mod tests {
         assert!(update.error.is_some());
         assert_eq!(load_side_button(&good), SideButtonAction::CreateLink);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preferences_default_mirror_on_and_round_trip_with_side_button() {
+        let p = temp_path("mirror");
+        assert!(load_mirror_enabled(&p));
+        assert!(parse_bytes(br#"{"v":1,"side_button":"create_link"}"#).mirror_amazon);
+        save_side_button(&p, SideButtonAction::CreateLink).unwrap();
+        save_mirror_enabled(&p, false).unwrap();
+        assert!(!load_mirror_enabled(&p));
+        assert_eq!(load_side_button(&p), SideButtonAction::CreateLink);
+        save_side_button(&p, SideButtonAction::NavigationUndo).unwrap();
+        assert!(!load_mirror_enabled(&p));
+        assert_eq!(load_side_button(&p), SideButtonAction::NavigationUndo);
+        save_mirror_enabled(&p, true).unwrap();
+        assert!(load_mirror_enabled(&p));
+        assert_eq!(load_side_button(&p), SideButtonAction::NavigationUndo);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]

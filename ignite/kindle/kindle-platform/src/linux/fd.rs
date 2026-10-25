@@ -130,12 +130,14 @@ pub fn abs_info(fd: &OwnedFd, axis: u16) -> PlatformResult<InputAbsinfo> {
 /// [`crate::linux::LinuxMonotonicClock`]. Failing is not fatal; it only means dispatch latency
 /// cannot be measured.
 pub fn set_clock_monotonic(fd: &OwnedFd) -> PlatformResult<()> {
-    let clk: i32 = libc::CLOCK_MONOTONIC;
+    // `clockid_t` is `i32` on Linux (the only runtime target) and `u32` on macOS hosts that only
+    // compile this crate for tests; naming the libc alias keeps both building.
+    let clk: libc::clockid_t = libc::CLOCK_MONOTONIC;
     let rc = unsafe {
         libc::ioctl(
             fd.raw(),
             eviocsclockid() as _,
-            &clk as *const i32 as *const libc::c_void,
+            &clk as *const libc::clockid_t as *const libc::c_void,
         )
     };
     if rc < 0 {

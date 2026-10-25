@@ -4,6 +4,7 @@ import { libraryPrefs } from "../app/libraryPrefs";
 import type { FinishedStroke } from "../authoring/capture";
 import { DEFAULT_TEXT_SESSION_FONT_SIZE, stepTextFontSize, textFontPercent } from "../authoring/textSession";
 import { SORT_LABELS } from "../model/librarySort";
+import { canActivateText, canEditPages, isAmazonMirror } from "../model/mirror";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
 import type { BlobCache } from "../rendering/background";
@@ -153,6 +154,8 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   const r = viewSnapshot ? resolve(viewSnapshot, viewSel) : null;
   const pageId = r?.page.page_id ?? "";
   const notebookId = r?.notebook.notebook_id ?? "";
+  const mirrorReadOnly = viewSnapshot ? isAmazonMirror(viewSnapshot, notebookId) : false;
+  const pagesEditable = canEditPages({ mirrorReadOnly, replicaAvailable: replica.kind === "ready", conflict: sync.conflict !== null });
   const mode = zoom && zoom.pageId === pageId ? zoom.mode : FIT;
 
   const go = useCallback(
@@ -394,6 +397,13 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
     return true;
   }, [finalizeTextForTransition, uiMode]);
 
+  // A refused leaveAuthoring (mid-stroke or failed finalize) is not retried until uiMode changes, by design.
+  // A switch into the read-only Amazon mirror leaves ink/type through the same gated transition as Done.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async gated transition, driven by the selection changing
+    if (mirrorReadOnly && uiMode !== "read") void leaveAuthoring("read");
+  }, [mirrorReadOnly, uiMode, leaveAuthoring]);
+
   const onErase = useCallback(
     async (g: EraseGesture): Promise<boolean> => {
       if (replica.kind !== "ready" || !pageId || !notebookId) return false;
@@ -599,7 +609,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
               Done
             </RoughControlButton>
           </span>
-        ) : (
+        ) : mirrorReadOnly ? null : (
           <>
             <RoughControlButton
               identity="write"
@@ -725,6 +735,11 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
         {drawerOpen && <div className="scrim" onClick={() => setDrawerOpen(false)} />}
 
         <main className="page-pane">
+          {mirrorReadOnly && (
+            <div className="mirror-banner" role="status" data-testid="mirror-banner">
+              Mirrored from Amazon. Read-only here; write in Ignite or copy it on the Kindle.
+            </div>
+          )}
           <PageView
             page={page}
             notebookId={notebookId}
@@ -745,7 +760,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
             textFontSize={textFontSize}
             onTextFontSizeChange={setTextFontSize}
             onActivateText={(t) => {
-              if (replica.kind !== "ready" || sync.conflict || drawing.current) return;
+              if (!canActivateText({ mirrorReadOnly, drawing: drawing.current, replicaAvailable: replica.kind === "ready", conflict: sync.conflict !== null })) return;
               void (async () => {
                 flushSync(() => setUiMode("type"));
                 const opened = await typeSession.current?.edit(t);
@@ -805,24 +820,28 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
               Undo
             </RoughControlButton>
           )}
-          <RoughControlButton
-            identity="insert-page"
-            data-testid="insert-page"
-            disabled={replica.kind !== "ready" || sync.conflict !== null}
-            title="Insert a blank page after this one"
-            onClick={() => void onInsertPage()}
-          >
-            Insert page
-          </RoughControlButton>
-          <RoughControlButton
-            identity="delete-page"
-            data-testid="delete-page"
-            disabled={replica.kind !== "ready" || sync.conflict !== null || pageCount < 2}
-            title={pageCount < 2 ? "A notebook needs at least one page." : "Delete this page"}
-            onClick={() => setPageConfirm("delete")}
-          >
-            Delete page
-          </RoughControlButton>
+          {!mirrorReadOnly && (
+            <>
+              <RoughControlButton
+                identity="insert-page"
+                data-testid="insert-page"
+                disabled={!pagesEditable}
+                title="Insert a blank page after this one"
+                onClick={() => void onInsertPage()}
+              >
+                Insert page
+              </RoughControlButton>
+              <RoughControlButton
+                identity="delete-page"
+                data-testid="delete-page"
+                disabled={!pagesEditable || pageCount < 2}
+                title={pageCount < 2 ? "A notebook needs at least one page." : "Delete this page"}
+                onClick={() => setPageConfirm("delete")}
+              >
+                Delete page
+              </RoughControlButton>
+            </>
+          )}
         </div>
         <div className="zoom-group">
           <RoughControlButton
@@ -862,7 +881,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
           {toast.text}
         </div>
       )}
-      {pageConfirm === "delete" && (
+      {pageConfirm === "delete" && !mirrorReadOnly && (
         <div className="dialog-scrim" onClick={() => setPageConfirm(null)}>
           <div className="dialog" role="dialog" aria-modal="true" aria-label="Delete page" data-testid="page-dialog" onClick={(e) => e.stopPropagation()}>
             <h2 className="dialog-heading">Delete this page?</h2>

@@ -16,6 +16,10 @@ const BUTTON_H: u32 = 170;
 const BUTTON_GAP: u32 = 30;
 const BUTTON_SCALE: u32 = 8;
 
+/// Body of the notice shown when a mirror notebook refuses an edit.
+pub const READ_ONLY_HINT: &str =
+    "This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TitlePurpose {
     Create,
@@ -46,12 +50,15 @@ pub enum Modal {
     CardMenu {
         notebook_id: String,
         title: String,
+        /// An Amazon mirror (read-only): the menu also offers COPY TO IGNITE.
+        mirror: bool,
     },
     /// Notebook menu for a notebook inside `folder_id`.
     CardMenuInFolder {
         notebook_id: String,
         title: String,
         folder_id: String,
+        mirror: bool,
     },
     /// + NEW on the main list: notebook or folder.
     NewChooser {
@@ -137,6 +144,22 @@ impl Modal {
         }
     }
 
+    /// A pen or command touched a read-only Amazon mirror.
+    pub fn read_only_mirror_notice() -> Self {
+        Self::Notice {
+            heading: "Read-only mirror".into(),
+            body: vec![READ_ONLY_HINT.into()],
+        }
+    }
+
+    /// COPY TO IGNITE on a mirror whose Kindle source was already imported.
+    pub fn already_copied_notice() -> Self {
+        Self::Notice {
+            heading: "Already copied".into(),
+            body: vec!["This Kindle notebook already has a copy in Ignite.".into()],
+        }
+    }
+
     pub fn no_folders_notice() -> Self {
         Self::Notice {
             heading: "No folders yet".into(),
@@ -179,6 +202,8 @@ pub enum ButtonId {
     PickerNext,
     Jump,
     RemoveLink,
+    /// Mirror card menu: import an editable copy.
+    CopyToIgnite,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,30 +232,51 @@ fn button(id: ButtonId, label: &str) -> DialogButton {
     }
 }
 
+/// A mirror notebook's menu offers only COPY TO IGNITE, DELETE and CANCEL: renaming or
+/// moving a mirror would be undone by the next rebuild (a deleted mirror is recreated at the
+/// next source change).
+fn card_menu_buttons(mirror: bool, rest: Vec<DialogButton>) -> Vec<DialogButton> {
+    if !mirror {
+        return rest;
+    }
+    let mut buttons = vec![button(ButtonId::CopyToIgnite, "COPY TO IGNITE")];
+    buttons.extend(
+        rest.into_iter()
+            .filter(|b| matches!(b.id, ButtonId::DeleteNotebook | ButtonId::Cancel)),
+    );
+    buttons
+}
+
 /// Dialog content for every modal except the full-screen title editor.
 pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
     Some(match modal {
-        Modal::CardMenu { title, .. } => DialogSpec {
+        Modal::CardMenu { title, mirror, .. } => DialogSpec {
             heading: title.clone(),
             body: Vec::new(),
-            buttons: vec![
-                button(ButtonId::Rename, "RENAME"),
-                button(ButtonId::AddToFolder, "ADD TO FOLDER"),
-                button(ButtonId::DeleteNotebook, "DELETE"),
-                button(ButtonId::Cancel, "CANCEL"),
-            ],
+            buttons: card_menu_buttons(
+                *mirror,
+                vec![
+                    button(ButtonId::Rename, "RENAME"),
+                    button(ButtonId::AddToFolder, "ADD TO FOLDER"),
+                    button(ButtonId::DeleteNotebook, "DELETE"),
+                    button(ButtonId::Cancel, "CANCEL"),
+                ],
+            ),
             vertical: true,
         },
-        Modal::CardMenuInFolder { title, .. } => DialogSpec {
+        Modal::CardMenuInFolder { title, mirror, .. } => DialogSpec {
             heading: title.clone(),
             body: Vec::new(),
-            buttons: vec![
-                button(ButtonId::Rename, "RENAME"),
-                button(ButtonId::ChangeFolder, "CHANGE FOLDER"),
-                button(ButtonId::RemoveFromFolder, "REMOVE FROM FOLDER"),
-                button(ButtonId::DeleteNotebook, "DELETE"),
-                button(ButtonId::Cancel, "CANCEL"),
-            ],
+            buttons: card_menu_buttons(
+                *mirror,
+                vec![
+                    button(ButtonId::Rename, "RENAME"),
+                    button(ButtonId::ChangeFolder, "CHANGE FOLDER"),
+                    button(ButtonId::RemoveFromFolder, "REMOVE FROM FOLDER"),
+                    button(ButtonId::DeleteNotebook, "DELETE"),
+                    button(ButtonId::Cancel, "CANCEL"),
+                ],
+            ),
             vertical: true,
         },
         Modal::NewChooser { .. } => DialogSpec {

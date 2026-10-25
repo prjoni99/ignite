@@ -51,7 +51,7 @@ use crate::library::{
     open_library_read_only, quarantine_notebook_dir, read_notebook_manifest_read_only,
     DeleteNotebookHooks, LibraryRepository, MAX_TITLE_CHARS,
 };
-use crate::notebook::{insert_page_after_durable, InsertPageHooks};
+use crate::notebook::{insert_page_after_durable, InsertPageHooks, PersistedNotebookManifestV1};
 use crate::pressure_curve::STYLE_PRESSURE_WIDTH_V1;
 use crate::profile::RenderProfile;
 use crate::store::load_existing_page;
@@ -69,7 +69,7 @@ pub const FALLBACK_TITLE: &str = "Kindle notebook";
 const CANVAS: (i128, i128) = (15624, 20832);
 /// Raw `nmdl.pressure` range, identical to the Scribe digitizer's ABS_PRESSURE range.
 const RAW_PRESSURE_MAX: f32 = 4095.0;
-const STROKES_PER_FSYNC: usize = 256;
+pub(crate) const STROKES_PER_FSYNC: usize = 256;
 
 /// Test-only fault points (crash = stop without any cleanup, as if the process died).
 #[cfg(test)]
@@ -95,7 +95,7 @@ const SIMULATED_CRASH: &str = "SIMULATED CRASH";
 const SYNC_HALT: &str = "sync halted";
 const CANCELLED: &str = "import cancelled";
 
-fn halt(e: DurableWaitError, what: &str) -> String {
+pub(crate) fn halt(e: DurableWaitError, what: &str) -> String {
     match e {
         DurableWaitError::Cancelled => format!("{CANCELLED} (waiting for {what})"),
         e => format!("{SYNC_HALT} ({what}): {e}"),
@@ -163,6 +163,21 @@ pub fn native_title(raw: Option<&str>) -> String {
 
 /// Standalone Amazon notebooks available locally (catalog order independent; sorted by title).
 pub fn discover(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
+    discover_filtered(src, true)
+}
+
+/// Like [`discover`], but a catalog row that is listed, not deleted and a standalone notebook
+/// is returned even when its directory or `nbk` file is missing. With no catalog (dev config)
+/// this is the same directory listing as [`discover`]. The mirror uses it so that a source the
+/// catalog still lists is never treated as removed.
+pub(crate) fn discover_listed(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
+    discover_filtered(src, false)
+}
+
+fn discover_filtered(
+    src: &ImportSources,
+    require_nbk: bool,
+) -> Result<Vec<SourceNotebook>, String> {
     let has_nbk = |id: &str| src.notebooks_root.join(id).join("nbk").is_file();
     let mut out = Vec::new();
     match src.catalog.as_ref().filter(|p| p.is_file()) {
@@ -173,7 +188,7 @@ pub fn discover(src: &ImportSources) -> Result<Vec<SourceNotebook>, String> {
                 if e.node_type.as_deref() == Some(STANDALONE_NOTEBOOK)
                     && !e.deleted
                     && is_uuid_like(&e.uuid)
-                    && has_nbk(&e.uuid)
+                    && (!require_nbk || has_nbk(&e.uuid))
                 {
                     out.push(SourceNotebook {
                         title: native_title(e.title.as_deref()),
@@ -263,7 +278,7 @@ pub struct Ledger {
     pub data: ReceiptsV1,
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent")?;
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = path.with_extension("tmp");
@@ -525,7 +540,7 @@ pub enum ImportOutcome {
 }
 
 /// Native strokes per page (canvas checked; empty strokes dropped).
-fn convert(nb: &DecodedNotebook) -> Result<(Vec<Vec<Stroke>>, usize), String> {
+pub(crate) fn convert(nb: &DecodedNotebook) -> Result<(Vec<Vec<Stroke>>, usize), String> {
     let mut pages = Vec::with_capacity(nb.pages.len());
     let mut skipped = 0;
     for p in &nb.pages {
@@ -716,7 +731,24 @@ fn import_one_admitted(
     }
 
     // 3. Empty notebook → empty pages → strokes.
-    match build(t, &dest, src, &pages, sync) {
+    let origin = ImportOriginV1 {
+        v: 1,
+        origin_kind: ORIGIN_KIND.into(),
+        origin_id: src.origin_id.clone(),
+        imported_unix_ms: now_ms(),
+    };
+    let origin_bytes = match serde_json::to_vec_pretty(&origin) {
+        Ok(b) => b,
+        Err(e) => return fail(ledger, &mut receipt, e.to_string()),
+    };
+    match build(
+        t,
+        &dest,
+        &src.title,
+        &pages,
+        (ORIGIN_MARKER, &origin_bytes),
+        sync,
+    ) {
         Ok(()) => {
             receipt.state = ReceiptState::Complete;
             receipt.finished_unix_ms = Some(now_ms());
@@ -757,45 +789,34 @@ fn import_one_admitted(
     }
 }
 
-fn build(
+pub(crate) fn build(
     t: &mut ImportTarget<'_>,
     dest: &str,
-    src: &SourceNotebook,
+    title: &str,
     pages: &[Vec<Stroke>],
+    marker: (&str, &[u8]),
     sync: &dyn ImportSync,
 ) -> Result<(), String> {
     let index = t.library.manifest().notebook_ids.len();
     let dims = (t.geo.xres, t.geo.yres, t.geo.line_length);
     create_notebook_at_durable(
-        t.library, dest, &src.title, index, "page-1", dims, t.paper, t.profile,
+        t.library, dest, title, index, "page-1", dims, t.paper, t.profile,
     )?;
     let nb_dir = t.library.notebook_dir(dest);
-    let origin = ImportOriginV1 {
-        v: 1,
-        origin_kind: ORIGIN_KIND.into(),
-        origin_id: src.origin_id.clone(),
-        imported_unix_ms: now_ms(),
-    };
-    write_atomic(
-        &nb_dir.join(ORIGIN_MARKER),
-        &serde_json::to_vec_pretty(&origin).map_err(|e| e.to_string())?,
-    )?;
-    sync.notebook_created(t.library, dest, &src.title);
+    write_atomic(&nb_dir.join(marker.0), marker.1)?;
+    sync.notebook_created(t.library, dest, title);
     sync.flush(t.cancel)
         .map_err(|e| halt(e, "notebook create"))?;
 
     let mut manifest = read_notebook_manifest_read_only(&nb_dir)?;
-    for _ in 1..pages.len() {
-        let after = manifest
-            .page_ids
-            .last()
-            .cloned()
-            .ok_or("notebook has no page")?;
-        let commit =
-            insert_page_after_durable(&nb_dir, &mut manifest, &after, &InsertPageHooks::default())?;
-        sync.page_created(&nb_dir, dest, &commit.inserted_page_id, &after);
-        sync.flush(t.cancel).map_err(|e| halt(e, "page create"))?;
-    }
+    insert_pages_after(
+        t.library,
+        dest,
+        &mut manifest,
+        pages.len().saturating_sub(1),
+        t.cancel,
+        sync,
+    )?;
     if manifest.page_ids.len() != pages.len() {
         return Err(format!(
             "page count {} != source {}",
@@ -803,19 +824,11 @@ fn build(
             pages.len()
         ));
     }
-    t.library
-        .set_cached_page_count(dest, manifest.page_ids.len());
     for (page_id, strokes) in manifest.page_ids.iter().zip(pages) {
         if strokes.is_empty() {
             continue;
         }
-        let (mut store, _) = load_existing_page(&nb_dir, page_id)?;
-        for chunk in strokes.chunks(STROKES_PER_FSYNC) {
-            store.append_committed_strokes(chunk)?;
-            sync.strokes_committed(dest, page_id, chunk);
-            // Backpressure: this batch's captures are durable before the next is written.
-            sync.flush(t.cancel).map_err(|e| halt(e, "strokes"))?;
-        }
+        write_page_strokes(&nb_dir, dest, page_id, strokes, t.cancel, sync)?;
         #[cfg(test)]
         {
             if fault(Fault::CrashAfterFirstPage) {
@@ -825,6 +838,57 @@ fn build(
                 return Err("simulated failure after the first page".into());
             }
         }
+    }
+    Ok(())
+}
+
+/// Append `count` empty pages after the notebook's last page, each one's create durable in the
+/// sync journal before the next (the cached page count follows every insert). Returns the new
+/// page ids in order.
+pub(crate) fn insert_pages_after(
+    library: &mut LibraryRepository,
+    notebook_id: &str,
+    manifest: &mut PersistedNotebookManifestV1,
+    count: usize,
+    cancel: &AtomicBool,
+    sync: &dyn ImportSync,
+) -> Result<Vec<String>, String> {
+    let nb_dir = library.notebook_dir(notebook_id);
+    let mut fresh = Vec::with_capacity(count);
+    for _ in 0..count {
+        let after = manifest
+            .page_ids
+            .last()
+            .cloned()
+            .ok_or("notebook has no page")?;
+        let commit =
+            insert_page_after_durable(&nb_dir, manifest, &after, &InsertPageHooks::default())?;
+        library.set_cached_page_count(notebook_id, manifest.page_ids.len());
+        sync.page_created(&nb_dir, notebook_id, &commit.inserted_page_id, &after);
+        sync.flush(cancel).map_err(|e| halt(e, "page create"))?;
+        fresh.push(commit.inserted_page_id);
+    }
+    Ok(fresh)
+}
+
+/// Append `strokes` to an existing page in [`STROKES_PER_FSYNC`] batches, each batch's captures
+/// durable before the next is written (backpressure).
+pub(crate) fn write_page_strokes(
+    nb_dir: &Path,
+    notebook_id: &str,
+    page_id: &str,
+    strokes: &[Stroke],
+    cancel: &AtomicBool,
+    sync: &dyn ImportSync,
+) -> Result<(), String> {
+    if strokes.is_empty() {
+        return Ok(());
+    }
+    let (mut store, _) = load_existing_page(nb_dir, page_id)?;
+    for chunk in strokes.chunks(STROKES_PER_FSYNC) {
+        store.append_committed_strokes(chunk)?;
+        sync.strokes_committed(notebook_id, page_id, chunk);
+        sync.flush(cancel).map_err(|e| halt(e, "strokes"))?;
     }
     Ok(())
 }

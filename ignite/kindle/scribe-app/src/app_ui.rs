@@ -84,6 +84,12 @@ pub enum UiCommand {
     ToolsScan,
     /// Tools: import every eligible Kindle notebook (one-way copy).
     ToolsImportAll,
+    /// Tools: run an Amazon mirror scan at the next safe point.
+    MirrorRescan,
+    /// Preferences: persist and apply the Amazon mirror switch.
+    SetMirrorEnabled(bool),
+    /// Home card menu: import an editable copy of this mirror notebook's Kindle source.
+    CopyMirror(String),
     /// Kindle-local folders (never synced).
     CreateFolder(String),
     RenameFolder {
@@ -147,6 +153,22 @@ impl UiCommand {
     }
 }
 
+/// Commands that would change the open notebook. On a mirror (read-only) notebook the runtime
+/// refuses them with the read-only hint; `RenameNotebook` only when it targets the open one.
+pub(crate) fn mutates_open_notebook(cmd: &UiCommand) -> bool {
+    matches!(
+        cmd,
+        UiCommand::Undo
+            | UiCommand::InsertPageAfter
+            | UiCommand::MovePageLeft
+            | UiCommand::MovePageRight
+            | UiCommand::DeletePage
+            | UiCommand::RemoveLink { .. }
+            | UiCommand::BeginCreateLink { .. }
+            | UiCommand::RenameNotebook { .. }
+    )
+}
+
 /// Notebook-view facts needed to resolve chrome and page-menu taps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NotebookUiContext {
@@ -168,6 +190,10 @@ pub struct UiState {
     pub tools: ToolsState,
     /// Replica-local side-button preference (durable file is outside the library).
     pub side_button: SideButtonAction,
+    /// Replica-local Amazon mirror switch (`preferences.json`); the runtime's single source.
+    pub mirror_enabled: bool,
+    /// `<library>/notebooks`, set by the runtime: a card menu checks the mirror marker here.
+    pub notebooks_root: Option<std::path::PathBuf>,
     /// Link-target picker (only while `AppView::LinkTargetPicker`).
     pub link_picker: Option<LinkPickerState>,
     /// Kindle-local folders (live members, library order), refreshed by the runtime before each
@@ -191,6 +217,8 @@ impl UiState {
             sync_view: None,
             tools: ToolsState::default(),
             side_button: SideButtonAction::NavigationUndo,
+            mirror_enabled: false,
+            notebooks_root: None,
             link_picker: None,
             folders: Vec::new(),
             next_folder_title: crate::folders::default_folder_title(1),
@@ -221,6 +249,15 @@ impl UiState {
         }
         let rows = self.home_rows(cards);
         self.home.settle(&rows, cards, &self.folders);
+    }
+
+    /// The notebook's directory holds the Amazon mirror marker (Home menus only; one stat).
+    pub fn is_mirror_notebook(&self, notebook_id: &str) -> bool {
+        self.notebooks_root.as_ref().is_some_and(|root| {
+            root.join(notebook_id)
+                .join(crate::mirror::MIRROR_MARKER)
+                .is_file()
+        })
     }
 
     fn folder_of(&self, notebook_id: &str) -> Option<&FolderInfo> {
@@ -539,13 +576,19 @@ impl UiState {
                 self.home.selected_index = i;
                 let notebook_id = cards[i].notebook_id.clone();
                 let title = cards[i].title.clone();
+                let mirror = self.is_mirror_notebook(&notebook_id);
                 self.modal = Some(match self.folder_of(&notebook_id) {
                     Some(f) => Modal::CardMenuInFolder {
                         folder_id: f.id.clone(),
                         notebook_id,
                         title,
+                        mirror,
                     },
-                    None => Modal::CardMenu { notebook_id, title },
+                    None => Modal::CardMenu {
+                        notebook_id,
+                        title,
+                        mirror,
+                    },
                 });
                 UiCommand::Redraw(Redraw::Full)
             }
@@ -568,6 +611,7 @@ impl UiState {
             Some(ToolsHit::Chrome(SettingsChromeHit::PreferencesTab)) => UiCommand::OpenPreferences,
             Some(ToolsHit::Scan) => UiCommand::ToolsScan,
             Some(ToolsHit::ImportAll) => UiCommand::ToolsImportAll,
+            Some(ToolsHit::MirrorRescan) => UiCommand::MirrorRescan,
         }
     }
 
@@ -583,6 +627,7 @@ impl UiState {
             Some(PreferencesHit::CreateLink) => {
                 UiCommand::SetSideButton(SideButtonAction::CreateLink)
             }
+            Some(PreferencesHit::MirrorToggle) => UiCommand::SetMirrorEnabled(!self.mirror_enabled),
         }
     }
 
@@ -690,7 +735,13 @@ impl UiState {
         };
         match (modal, button) {
             (
-                Modal::CardMenu { notebook_id, title }
+                Modal::CardMenu { notebook_id, .. } | Modal::CardMenuInFolder { notebook_id, .. },
+                ButtonId::CopyToIgnite,
+            ) => UiCommand::CopyMirror(notebook_id),
+            (
+                Modal::CardMenu {
+                    notebook_id, title, ..
+                }
                 | Modal::CardMenuInFolder {
                     notebook_id, title, ..
                 },
@@ -706,7 +757,9 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             (
-                Modal::CardMenu { notebook_id, title }
+                Modal::CardMenu {
+                    notebook_id, title, ..
+                }
                 | Modal::CardMenuInFolder {
                     notebook_id, title, ..
                 },
@@ -722,7 +775,12 @@ impl UiState {
             (Modal::ConfirmDeleteNotebook { notebook_id, .. }, ButtonId::ConfirmDelete) => {
                 UiCommand::DeleteNotebook(notebook_id)
             }
-            (Modal::CardMenu { notebook_id, title }, ButtonId::AddToFolder) => {
+            (
+                Modal::CardMenu {
+                    notebook_id, title, ..
+                },
+                ButtonId::AddToFolder,
+            ) => {
                 self.modal = Some(self.picker(notebook_id, title, None));
                 UiCommand::Redraw(Redraw::Full)
             }
@@ -731,6 +789,7 @@ impl UiState {
                     notebook_id,
                     title,
                     folder_id,
+                    ..
                 },
                 ButtonId::ChangeFolder,
             ) => {
@@ -1079,5 +1138,154 @@ impl PenRouter {
 
     pub fn on_stream_gap(&mut self) {
         self.ui_contact = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutates_open_notebook_lists_exactly_the_gated_commands() {
+        let link_id = sync_protocol::LinkId::from_uuid(uuid::Uuid::now_v7()).unwrap();
+        for cmd in [
+            UiCommand::Undo,
+            UiCommand::InsertPageAfter,
+            UiCommand::MovePageLeft,
+            UiCommand::MovePageRight,
+            UiCommand::DeletePage,
+            UiCommand::RemoveLink { link_id },
+            UiCommand::BeginCreateLink { x: 1.0, y: 2.0 },
+            UiCommand::RenameNotebook {
+                notebook_id: "n".into(),
+                title: "t".into(),
+            },
+        ] {
+            assert!(mutates_open_notebook(&cmd), "{cmd:?}");
+        }
+        for cmd in [
+            UiCommand::None,
+            UiCommand::PreviousPage,
+            UiCommand::NextPage,
+            UiCommand::GoHome,
+            UiCommand::OpenLinkPopup { link_id },
+            UiCommand::JumpLink {
+                notebook_local: "n".into(),
+                page_local: "p".into(),
+            },
+            UiCommand::CopyMirror("n".into()),
+            UiCommand::MirrorRescan,
+            UiCommand::SetMirrorEnabled(true),
+            UiCommand::DeleteNotebook("n".into()),
+        ] {
+            assert!(!mutates_open_notebook(&cmd), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn card_menu_marks_mirror_notebooks_and_offers_copy_to_ignite() {
+        let dir = std::env::temp_dir().join(format!(
+            "scribe-app-ui-mirror-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs_mirror(&dir, "m1");
+        std::fs::create_dir_all(dir.join("n1")).unwrap();
+        let mut ui = UiState::launch_home(0, 2);
+        ui.notebooks_root = Some(dir.clone());
+        assert!(ui.is_mirror_notebook("m1"));
+        assert!(!ui.is_mirror_notebook("n1"));
+        ui.notebooks_root = None;
+        assert!(!ui.is_mirror_notebook("m1"));
+
+        let g = crate::ui_gfx::panel_geo();
+        let menu = Modal::CardMenu {
+            notebook_id: "m1".into(),
+            title: "Kindle".into(),
+            mirror: true,
+        };
+        let spec = dialog_spec(&menu).unwrap();
+        let labels = |s: &crate::modal::DialogSpec| {
+            s.buttons
+                .iter()
+                .map(|b| b.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&spec), ["COPY TO IGNITE", "DELETE", "CANCEL"]);
+        let in_folder = Modal::CardMenuInFolder {
+            notebook_id: "m1".into(),
+            title: "Kindle".into(),
+            folder_id: "amazon".into(),
+            mirror: true,
+        };
+        assert_eq!(
+            labels(&dialog_spec(&in_folder).unwrap()),
+            ["COPY TO IGNITE", "DELETE", "CANCEL"]
+        );
+        let r = DialogLayout::new(&g, &spec)
+            .buttons
+            .iter()
+            .find(|(b, _)| b.id == ButtonId::CopyToIgnite)
+            .map(|(_, r)| *r)
+            .unwrap();
+        ui.modal = Some(menu);
+        let cmd = ui.on_tap(
+            &g,
+            UiPoint::new(r.x + r.w / 2, r.y + r.h / 2),
+            &[],
+            "x",
+            None,
+        );
+        assert_eq!(cmd, UiCommand::CopyMirror("m1".into()));
+        assert!(ui.modal.is_none());
+
+        let plain = Modal::CardMenuInFolder {
+            notebook_id: "n1".into(),
+            title: "Mine".into(),
+            folder_id: "f".into(),
+            mirror: false,
+        };
+        assert_eq!(
+            labels(&dialog_spec(&plain).unwrap()),
+            [
+                "RENAME",
+                "CHANGE FOLDER",
+                "REMOVE FROM FOLDER",
+                "DELETE",
+                "CANCEL"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mirror_read_only_and_already_copied_are_notices_not_errors() {
+        let ro = Modal::read_only_mirror_notice();
+        let spec = dialog_spec(&ro).unwrap();
+        assert_eq!(spec.heading, "Read-only mirror");
+        assert_eq!(spec.body, [crate::modal::READ_ONLY_HINT]);
+        let laid = DialogLayout::new(&crate::ui_gfx::panel_geo(), &spec);
+        let text: Vec<&str> = laid.body.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            text.join(" "),
+            crate::modal::READ_ONLY_HINT,
+            "wrapped, not truncated"
+        );
+        let done = Modal::already_copied_notice();
+        assert!(matches!(&done, Modal::Notice { heading, body }
+            if heading == "Already copied"
+                && body == &["This Kindle notebook already has a copy in Ignite."]));
+        let mut ui = UiState::launch_home(0, 1);
+        ui.show_modal(ro);
+        assert!(matches!(ui.modal, Some(Modal::Notice { .. })));
+    }
+
+    fn fs_mirror(root: &std::path::Path, id: &str) {
+        let d = root.join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(crate::mirror::MIRROR_MARKER), b"{}").unwrap();
     }
 }

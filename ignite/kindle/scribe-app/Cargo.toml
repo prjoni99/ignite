@@ -41,6 +41,7 @@ ctrlc = { version = "3.4", features = ["termination"] }
 ureq = { version = "2", default-features = false }
 sync-engine = { workspace = true }
 nbk-reader = { workspace = true }
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # D1: paired-server control plane + DNS-SD discovery (no async runtime, no TLS).

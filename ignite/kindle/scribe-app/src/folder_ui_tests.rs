@@ -293,6 +293,7 @@ mod tests {
             notebook_id: "notebook-1".into(),
             title: "Notebook 1".into(),
             folder_id: "folder-1".into(),
+            mirror: false,
         });
         let menu = ui.modal.clone().unwrap();
         ui.on_tap(&g, button(&g, &menu, "CHANGE FOLDER"), &c, "x", None);
@@ -301,6 +302,7 @@ mod tests {
         let menu = Modal::CardMenu {
             notebook_id: "notebook-1".into(),
             title: "Notebook 1".into(),
+            mirror: false,
         };
         ui.modal = Some(menu.clone());
         ui.on_tap(&g, button(&g, &menu, "ADD TO FOLDER"), &c, "x", None);
@@ -316,6 +318,7 @@ mod tests {
         let menu = Modal::CardMenu {
             notebook_id: "notebook-1".into(),
             title: "Notebook 1".into(),
+            mirror: false,
         };
         ui.modal = Some(menu.clone());
         ui.on_tap(&g, button(&g, &menu, "ADD TO FOLDER"), &c, "x", None);

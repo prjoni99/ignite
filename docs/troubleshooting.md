@@ -102,3 +102,40 @@ Ordinary handwriting does not require a server. If you enable self-hosted sync:
   threat model
 - Do not enable experimental server lineage-replacement acceptance unless you
   are following a controlled recovery procedure (not part of normal install)
+
+## Amazon mirror (optional)
+
+Stock Kindle notebooks are mirrored read-only into the `Amazon` folder when
+sync is linked. See `docs/architecture.md`.
+
+**Notebook not appearing under Amazon.** Check in order:
+
+1. Sync is linked (Sync view); the mirror never runs while sync is off.
+2. Preferences → `AMAZON MIRROR` → `Mirror Amazon notebooks` is On.
+3. The Kindle has finished saving the notebook; a source still being written
+   or whose action log is ahead of its saved state is not listed anywhere and
+   is retried at the next scan.
+4. Tools → MIRROR block: an unreadable or unsupported source (`NBK_CONTAINER`,
+   `NBK_UNSUPPORTED`) is listed there and not retried until it changes.
+5. Press `RESCAN NOW` in Tools.
+
+**Nothing happens while writing.** Expected: the mirror does nothing with a page
+open.
+
+**Mirror paused, nothing removed.** If the notebooks root or catalog is
+missing (storage not mounted), or a listed source's directory or `nbk` is
+missing, the mirror takes no action for it rather than removing anything.
+
+**Can't edit a mirror.** On the Kindle an open mirror refuses edits with a
+`Read-only mirror` notice, and its card menu offers only `COPY TO IGNITE` and
+`DELETE`. Use Copy to Ignite for an editable notebook. Renaming the `Amazon`
+folder or moving a notebook out of it (browser or Kindle) lifts the browser's
+read-only treatment, but any ink or text added afterwards is discarded at the
+next rebuild.
+
+**Removed from Amazon.** The source was deleted on the Kindle; its mirror is
+kept there, never deleted. It returns to `Amazon` if the source reappears. A
+mirror you deleted in Ignite is recreated at the source's next change.
+
+**Log lines.** `mirror_scan`, `mirror_step` and `mirror_recovered` appear in
+the app log.
