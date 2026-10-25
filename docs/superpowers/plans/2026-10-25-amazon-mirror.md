@@ -431,11 +431,17 @@ describe("isAmazonMirror", () => {
 
 On the verified Scribe (FW 5.18.6) with sync linked:
 
-- [ ] Write a page in Amazon's notebook app, return to Ignite Home: within one scan the notebook appears under `Amazon` in the browser companion with matching strokes.
-- [ ] `ls -la --time-style=full-iso /mnt/us/.notebooks/<uuid>/` before and after: no new files, no mtime change, no `nbk-journal`.
-- [ ] Open the mirror on the Kindle and try to write: the read-only hint shows, no stroke lands.
-- [ ] Delete the notebook in Amazon's app: it moves to `Removed from Amazon`.
-- [ ] Home responsiveness during a 50+ page rebuild: with a 50+ page Amazon notebook changed, stay on Home while the rebuild runs (one action per loop pass). Opening a notebook, scrolling the card list and the Home card menu must respond within the usual budget; no touch is dropped and the rebuild resumes once Home shows again. Note the longest pause observed.
-- [ ] Switching to the Amazon app mid-rebuild: with the Tools block showing `pending`, press the Kindle home button during the rebuild. Ignite stops cleanly (`child_stop signal=SIGTERM` → `child_exited status=0`); on relaunch the `Rebuilding` entry is recovered at the first safe point once sync is linked (`mirror_recovered count=1`), the next scan rebuilds it, and exactly one mirror of that UUID exists in the library and on the server.
-- [ ] Notice wording on the device: the read-only hint reads `Read-only mirror` / `This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.`; a second Copy to Ignite reads `Already copied` / `This Kindle notebook already has a copy in Ignite.`; the Tools block reads `Amazon mirror: on (waiting for sync), ...` while unpaired and `Amazon mirror: on, ...` once linked, with `last scan skipped N listed but missing on disk` only when a listed source is missing. Each fits its line at the Tools scale (no clipped words).
-- [ ] Record results in the release qualification notes.
+> Run 2026-10-25 on a Scribe 2024 (FW 5.19.6, "Tester" class) against fork `main` 648b2bc
+> (0.9.14), Ignite Server 0.9.14 native on macOS, ignite-web dev server. 4 of 7 passed, 3 not run.
+> Findings: the 15-minute idle rescan makes a page written in Amazon's app look unsynced until
+> RESCAN NOW (then ~20 s); the browser shows Undo on a read-only mirror; the browser treats only
+> the `Amazon` folder as read-only, so `Removed from Amazon` notebooks are editable there.
+
+- [x] (2026-10-25 PASS: existing notebooks at first scan; new MCS page after RESCAN NOW, 6→14→8 pages transient) Write a page in Amazon's notebook app, return to Ignite Home: within one scan the notebook appears under `Amazon` in the browser companion with matching strokes.
+- [ ] (2026-10-25 NOT RUN: no shell on the device) `ls -la --time-style=full-iso /mnt/us/.notebooks/<uuid>/` before and after: no new files, no mtime change, no `nbk-journal`.
+- [x] (2026-10-25 PASS: wording exact, no ink) Open the mirror on the Kindle and try to write: the read-only hint shows, no stroke lands.
+- [x] (2026-10-25 PASS: throwaway notebook created, mirrored, deleted, moved with strokes intact) Delete the notebook in Amazon's app: it moves to `Removed from Amazon`.
+- [ ] (2026-10-25 NOT RUN) Home responsiveness during a 50+ page rebuild: with a 50+ page Amazon notebook changed, stay on Home while the rebuild runs (one action per loop pass). Opening a notebook, scrolling the card list and the Home card menu must respond within the usual budget; no touch is dropped and the rebuild resumes once Home shows again. Note the longest pause observed.
+- [ ] (2026-10-25 NOT RUN) Switching to the Amazon app mid-rebuild: with the Tools block showing `pending`, press the Kindle home button during the rebuild. Ignite stops cleanly (`child_stop signal=SIGTERM` → `child_exited status=0`); on relaunch the `Rebuilding` entry is recovered at the first safe point once sync is linked (`mirror_recovered count=1`), the next scan rebuilds it, and exactly one mirror of that UUID exists in the library and on the server.
+- [ ] (2026-10-25 PARTIAL: read-only hint verified; Tools block and Already copied not checked) Notice wording on the device: the read-only hint reads `Read-only mirror` / `This notebook mirrors Amazon and is read-only. Use Copy to Ignite from Home.`; a second Copy to Ignite reads `Already copied` / `This Kindle notebook already has a copy in Ignite.`; the Tools block reads `Amazon mirror: on (waiting for sync), ...` while unpaired and `Amazon mirror: on, ...` once linked, with `last scan skipped N listed but missing on disk` only when a listed source is missing. Each fits its line at the Tools scale (no clipped words).
+- [x] Record results in the release qualification notes (this block; `docs/compatibility.md` Scribe 2024 row).
