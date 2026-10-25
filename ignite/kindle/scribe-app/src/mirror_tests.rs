@@ -1371,3 +1371,73 @@ fn rebuild_after_the_user_deleted_the_mirror_builds_exactly_one_new_notebook() {
         r.ledger.data.amazon_folder.as_deref()
     );
 }
+
+// ------------------------------------------------------------------------- scheduling
+
+#[test]
+fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() {
+    let t0 = Instant::now();
+    let launch = MirrorClock {
+        last_scan: None,
+        last_batches: 0,
+    };
+    assert!(scan_due(&launch, t0, 0));
+    let after = MirrorClock {
+        last_scan: Some(t0),
+        last_batches: 3,
+    };
+    assert!(!scan_due(&after, t0, 3));
+    assert!(!scan_due(&after, t0 + Duration::from_secs(60), 3));
+    assert!(scan_due(&after, t0 + Duration::from_secs(60), 4));
+    assert!(!scan_due(
+        &after,
+        t0 + IDLE_RESCAN - Duration::from_secs(1),
+        3
+    ));
+    assert!(scan_due(&after, t0 + IDLE_RESCAN, 3));
+}
+
+#[test]
+fn a_rebuild_never_runs_while_a_page_is_open() {
+    use crate::home::AppView;
+    for v in [
+        AppView::Notebook,
+        AppView::Sync,
+        AppView::Preferences,
+        AppView::LinkTargetPicker,
+    ] {
+        assert!(!step_allowed(v, false, true));
+    }
+    assert!(step_allowed(AppView::Home, false, true));
+    assert!(step_allowed(AppView::Tools, false, true));
+    assert!(!step_allowed(AppView::Home, true, true));
+    assert!(!step_allowed(AppView::Tools, false, false));
+}
+
+#[test]
+fn a_scan_error_never_removes_existing_mirrors() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    let before = l.data.clone();
+    // A catalog that exists but is not a readable database: discover must fail.
+    fs::write(
+        &k.catalog,
+        b"this is not a sqlite database at all, just garbage bytes",
+    )
+    .unwrap();
+    match scan(&k.sources(), &l) {
+        Err(_) => {}
+        Ok(got) => assert!(
+            !got.actions
+                .iter()
+                .any(|a| matches!(a, MirrorAction::Remove { .. })),
+            "a scan error must never remove: {got:?}"
+        ),
+    }
+    assert_eq!(l.data, before);
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, before);
+}

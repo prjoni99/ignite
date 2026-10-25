@@ -10,17 +10,18 @@
 //! and, like the import ledger, fails closed when it cannot be trusted.
 
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nbk_reader::{DecodedNotebook, NbkError};
 use notebook_core::Stroke;
 use serde::{Deserialize, Serialize};
 
 use crate::folders::FolderStore;
+use crate::home::AppView;
 use crate::library::{
     allocate_fresh_notebook_id, read_notebook_manifest_read_only, rename_notebook_durable,
     LibraryRepository, RenameNotebookHooks,
@@ -992,6 +993,42 @@ pub(crate) fn recover_interrupted(
     } else {
         Err(format!("mirror recovery: {}", errors.join("; ")))
     }
+}
+
+// ------------------------------------------------------------------------- scheduling
+
+/// A queued rebuild pass: one action is applied per structural safe point.
+#[derive(Debug, Default)]
+pub struct MirrorRun {
+    pub queue: VecDeque<MirrorAction>,
+    pub done: usize,
+    /// `(origin_id, detail)` of actions that failed this run.
+    pub failed: Vec<(String, String)>,
+}
+
+/// When the last scan ran and the upload batch counter it saw.
+#[derive(Debug, Default)]
+pub struct MirrorClock {
+    pub last_scan: Option<Instant>,
+    pub last_batches: u64,
+}
+
+/// Rescan this often even when no upload batch completed.
+pub const IDLE_RESCAN: Duration = Duration::from_secs(15 * 60);
+
+/// Should a scan start now? launch (last_scan None), upload batch count advanced, or idle timer elapsed.
+pub fn scan_due(clock: &MirrorClock, now: Instant, batches: u64) -> bool {
+    match clock.last_scan {
+        None => true,
+        Some(last) => {
+            batches > clock.last_batches || now.saturating_duration_since(last) >= IDLE_RESCAN
+        }
+    }
+}
+
+/// May a rebuild step run now? Home or Tools only, no import run, sync linked and capture-ready.
+pub fn step_allowed(view: AppView, import_running: bool, sync_linked: bool) -> bool {
+    matches!(view, AppView::Home | AppView::Tools) && !import_running && sync_linked
 }
 
 #[cfg(test)]
