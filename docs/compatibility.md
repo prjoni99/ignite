@@ -19,7 +19,7 @@ Evidence classes:
 | Kindle | Firmware | Ignite | Install | Ink / polarity | Class | Notes |
 |--------|----------|--------|---------|----------------|-------|-------|
 | Scribe (1st gen / 2022) | 5.18.6 | **0.9.11** | Fresh install/migrate + idempotent reinstall on device | `grayscale=2`, identity polarity | **Verified** | Namespace `com.markrai.ignite`; Scriptlet SHA-256 `7c71b74887ffa546febacb9ff361f8c2cfd2719f8b4dd1d4083d963fd1f0e1e0` |
-| Scribe (2024) | 5.19.6 | 0.9.11 candidate | Intended | `grayscale=1`, complement polarity | **Tester** / in progress | Polarity fix from 0.9.10; confirm identity migration + polarity on device |
+| Scribe (2024) | 5.19.6 | 0.9.14 (source build, fork main 648b2bc) | Upgrade over 0.9.14 release via Documents sideload: OK | `grayscale=1`, complement polarity | **Tester** / in progress | 2026-10-25: pairing + sync to Ignite Server 0.9.14 OK; Amazon mirror appears / read-only / Removed from Amazon OK; rebuild-responsiveness and mid-rebuild recovery not run (plan Task 10) |
 | Other Kindle models | — | — | — | — | **Untested** | Not a goal of current packages |
 | Stock (no jailbreak) | any | — | Will refuse | — | **Verified** refusal | Missing root helper / preparation |
 
