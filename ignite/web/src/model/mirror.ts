@@ -9,3 +9,8 @@ export function isAmazonMirror(snapshot: Pick<SyncSnapshotV1, "notebooks" | "fol
   if (!folderId) return false;
   return snapshot.folders.some((f) => f.folder_id === folderId && f.title === AMAZON_FOLDER_TITLE);
 }
+
+/** Whether a tap on an existing text box may open a type session. Never on a read-only mirror. */
+export function canActivateText(opts: { mirrorReadOnly: boolean; drawing: boolean; replicaAvailable: boolean; conflict: boolean }): boolean {
+  return !opts.mirrorReadOnly && !opts.drawing && opts.replicaAvailable && !opts.conflict;
+}

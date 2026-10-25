@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isAmazonMirror } from "../src/model/mirror";
+import { canActivateText, isAmazonMirror } from "../src/model/mirror";
 import type { SnapshotFolder, SnapshotNotebook } from "../src/model/types";
 
 const F_AMAZON = "01a0c450-6c10-7101-8203-040506070801";
@@ -40,4 +40,15 @@ describe("isAmazonMirror", () => {
   it("is case-sensitive on the folder title", () => expect(isAmazonMirror(snap, NB_LOWER)).toBe(false));
   it("is false when folder_id matches no folder", () => expect(isAmazonMirror(snap, NB_ORPHAN)).toBe(false));
   it("is false for an unknown notebook", () => expect(isAmazonMirror(snap, "nope")).toBe(false));
+});
+
+describe("canActivateText", () => {
+  const ok = { mirrorReadOnly: false, drawing: false, replicaAvailable: true, conflict: false };
+  it("allows a normal notebook", () => expect(canActivateText(ok)).toBe(true));
+  it("refuses on a mirror", () => expect(canActivateText({ ...ok, mirrorReadOnly: true })).toBe(false));
+  it("refuses mid-stroke, without a replica, or in conflict", () => {
+    expect(canActivateText({ ...ok, drawing: true })).toBe(false);
+    expect(canActivateText({ ...ok, replicaAvailable: false })).toBe(false);
+    expect(canActivateText({ ...ok, conflict: true })).toBe(false);
+  });
 });

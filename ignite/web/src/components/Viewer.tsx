@@ -4,7 +4,7 @@ import { libraryPrefs } from "../app/libraryPrefs";
 import type { FinishedStroke } from "../authoring/capture";
 import { DEFAULT_TEXT_SESSION_FONT_SIZE, stepTextFontSize, textFontPercent } from "../authoring/textSession";
 import { SORT_LABELS } from "../model/librarySort";
-import { isAmazonMirror } from "../model/mirror";
+import { canActivateText, isAmazonMirror } from "../model/mirror";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
 import type { BlobCache } from "../rendering/background";
@@ -396,6 +396,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
     return true;
   }, [finalizeTextForTransition, uiMode]);
 
+  // A refused leaveAuthoring (mid-stroke or failed finalize) is not retried until uiMode changes, by design.
   // A switch into the read-only Amazon mirror leaves ink/type through the same gated transition as Done.
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- async gated transition, driven by the selection changing
@@ -758,7 +759,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
             textFontSize={textFontSize}
             onTextFontSizeChange={setTextFontSize}
             onActivateText={(t) => {
-              if (replica.kind !== "ready" || sync.conflict || drawing.current) return;
+              if (!canActivateText({ mirrorReadOnly, drawing: drawing.current, replicaAvailable: replica.kind === "ready", conflict: sync.conflict !== null })) return;
               void (async () => {
                 flushSync(() => setUiMode("type"));
                 const opened = await typeSession.current?.edit(t);
