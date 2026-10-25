@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::sync_local::DEFAULT_REPLICA_STATE_DIR;
+use crate::templates::TemplateId;
 
 pub const PREFERENCES_FILE: &str = "preferences.json";
 const PREFERENCES_VERSION: u32 = 1;
@@ -32,6 +33,9 @@ struct PreferencesFile {
     /// Mirror Amazon's stock notebooks into the read-only Amazon folder. On by default.
     #[serde(default = "default_true")]
     mirror_amazon: bool,
+    /// Last template used when creating a notebook or inserting a page. Defaults to blank.
+    #[serde(default)]
+    template: TemplateId,
 }
 
 fn default_true() -> bool {
@@ -44,6 +48,7 @@ impl Default for PreferencesFile {
             v: PREFERENCES_VERSION,
             side_button: SideButtonAction::NavigationUndo,
             mirror_amazon: true,
+            template: TemplateId::default(),
         }
     }
 }
@@ -102,6 +107,20 @@ pub fn load_mirror_enabled(path: &Path) -> bool {
 pub fn save_mirror_enabled(path: &Path, enabled: bool) -> Result<(), String> {
     let file = PreferencesFile {
         mirror_amazon: enabled,
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+/// Load the last-used template. Missing/unreadable/malformed → `Builtin { id: "blank" }`.
+pub fn load_template(path: &Path) -> TemplateId {
+    load(path).template
+}
+
+/// Persist the last-used template, keeping the other preferences.
+pub fn save_template(path: &Path, id: &TemplateId) -> Result<(), String> {
+    let file = PreferencesFile {
+        template: id.clone(),
         ..load(path)
     };
     write(path, &file)
