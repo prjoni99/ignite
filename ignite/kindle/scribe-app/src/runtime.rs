@@ -65,11 +65,12 @@ use crate::nav::{dispatch_side_button, NavDownAction, NavGestureState, SideButto
 use crate::notebook::{
     allocate_page_id, commit_new_page_to_manifest, consume_dev_notebook_op,
     create_page_files_from_template, delete_page_durable, insert_page_after_durable,
-    load_page_for_switch, move_page_durable, page_index, peek_dev_notebook_op, persist_active_page,
-    DeletePageHooks, DevNotebookOp, InsertPageHooks, MovePageDirection, MovePageHooks,
-    NotebookOpen, PageSwitchDirection, PersistedNotebookManifestV1, QuarantineOutcome,
-    DEV_DELETE_CURRENT_PAGE_TRIGGER, DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER,
-    DEV_MOVE_PAGE_RIGHT_TRIGGER, NOTEBOOK_MANIFEST_VERSION,
+    insert_page_after_with_background, load_page_for_switch, move_page_durable, page_index,
+    peek_dev_notebook_op, persist_active_page, DeletePageHooks, DevNotebookOp, InsertPageHooks,
+    MovePageDirection, MovePageHooks, NotebookOpen, PageSwitchDirection,
+    PersistedNotebookManifestV1, QuarantineOutcome, DEV_DELETE_CURRENT_PAGE_TRIGGER,
+    DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER, DEV_MOVE_PAGE_RIGHT_TRIGGER,
+    NOTEBOOK_MANIFEST_VERSION,
 };
 use crate::open_page::BoundPageKey;
 use crate::orch::{
@@ -80,6 +81,7 @@ use crate::prefs::{self, SideButtonAction};
 use crate::pressure::PressureStrokeSummary;
 use crate::profile::RenderProfile;
 use crate::store::{page_dir, resolve_data_dir, PageStore, RuntimeStore, DEFAULT_PAGE_ID};
+use crate::templates::{self, TemplateId};
 use crate::text_paint::TextOverlay;
 use crate::touch::{
     CoalesceDecision, FingerAction, MovePreviewCoalesce, TouchArbiter, TouchMapping,
@@ -1575,29 +1577,35 @@ fn move_current_page(
     Ok(true)
 }
 
-/// F9: durable insert blank page after current. Binds/reconstructs the new page.
+/// F9: durable insert blank page after current. Binds/reconstructs the new page. With
+/// `background`, the new page uses that bitmap (a page template) instead of the current
+/// page's background.
 fn insert_page_after_current(
     data_dir: &Path,
     manifest: &mut PersistedNotebookManifestV1,
     ctrl: &mut KindleCtrl,
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
+    background: Option<&[u8]>,
 ) -> Result<bool, String> {
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_insert_ignored reason=not_idle");
         return Ok(false);
     }
     let after_id = ctrl.session.page_id().to_string();
-    let commit =
-        match insert_page_after_durable(data_dir, manifest, &after_id, &InsertPageHooks::default())
-        {
-            Ok(c) => c,
-            Err(e) if e.starts_with("REFUSE PAGE INSERT") => {
-                println!("page_insert_refused detail={e}");
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
+    let hooks = InsertPageHooks::default();
+    let inserted = match background {
+        None => insert_page_after_durable(data_dir, manifest, &after_id, &hooks),
+        Some(bg) => insert_page_after_with_background(data_dir, manifest, &after_id, bg, &hooks),
+    };
+    let commit = match inserted {
+        Ok(c) => c,
+        Err(e) if e.starts_with("REFUSE PAGE INSERT") => {
+            println!("page_insert_refused detail={e}");
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     crate::sync_outbound::with_global(|s| {
         s.page_created(
             data_dir,
@@ -3137,6 +3145,80 @@ fn remove_page_link(
     present_ui(x, ctrl, None)
 }
 
+/// Last used template: persisted (a failed save only loses the preselection) and preselected.
+fn remember_template(x: &mut UiExec<'_>, template: TemplateId) {
+    if let Err(e) = prefs::save_template(x.prefs_path, &template) {
+        eprintln!("template_pref_save_failed detail={e}");
+    }
+    x.ui.template = template;
+}
+
+/// UI notebook create: the first page's background is `paper`; filed in `folder_id` when set;
+/// `template` is remembered as the last used once the notebook exists.
+fn create_notebook_from_ui(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    title: &str,
+    folder_id: Option<&str>,
+    paper: &[u8],
+    template: Option<TemplateId>,
+) -> Result<(), String> {
+    match create_notebook_durable(
+        x.library,
+        x.notebook_profile,
+        &x.geo,
+        paper,
+        Some(title),
+        &CreateNotebookHooks::default(),
+    ) {
+        Ok(commit) => {
+            sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
+            let folder_log = folder_id
+                .map(|f| format!(" folder={f}"))
+                .unwrap_or_default();
+            println!(
+                "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui{folder_log}",
+                commit.notebook_id,
+                commit.title,
+                commit.manifest_persist_us,
+                x.library.active_notebook_id()
+            );
+            if let Some(folder_id) = folder_id {
+                // The notebook exists either way; a filing failure only leaves it on the
+                // main list.
+                let live = x.library.manifest().notebook_ids.clone();
+                match x
+                    .folders
+                    .set_folder(&commit.notebook_id, Some(folder_id), &live)
+                {
+                    Ok(()) => capture_folder_change(
+                        x.folders,
+                        FolderCapture::Filed {
+                            notebook: commit.notebook_id.clone(),
+                            folder: Some(folder_id.to_string()),
+                        },
+                    ),
+                    Err(e) => eprintln!(
+                        "folder_membership_changed_failed notebook={} detail={e}",
+                        commit.notebook_id
+                    ),
+                }
+            }
+            if let Some(template) = template {
+                remember_template(x, template);
+            }
+            x.ui.enter_notebook();
+            install_active_notebook(x, ctrl)
+                .map_err(|e| format!("FATAL: notebook create committed but open failed: {e}"))
+        }
+        Err(e) => {
+            eprintln!("notebook_create_failed title={title:?} detail={e}");
+            x.ui.show_error("The notebook couldn't be created.");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
 /// Execute one UI command. `Err` is fatal (fail closed); recoverable failures become an
 /// on-screen error dialog with details only in the log.
 fn execute_ui_command(
@@ -3402,85 +3484,36 @@ fn execute_ui_command(
         ),
         UiCommand::CreateNotebookInFolder { title, folder_id } => {
             let paper = paper_background(&x.geo);
-            match create_notebook_durable(
-                x.library,
-                x.notebook_profile,
-                &x.geo,
-                &paper,
-                Some(&title),
-                &CreateNotebookHooks::default(),
-            ) {
-                Ok(commit) => {
-                    sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
-                    println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui folder={folder_id}",
-                        commit.notebook_id,
-                        commit.title,
-                        commit.manifest_persist_us,
-                        x.library.active_notebook_id()
-                    );
-                    // The notebook exists either way; a filing failure only leaves it on the
-                    // main list.
-                    let live = x.library.manifest().notebook_ids.clone();
-                    match x
-                        .folders
-                        .set_folder(&commit.notebook_id, Some(&folder_id), &live)
-                    {
-                        Ok(()) => capture_folder_change(
-                            x.folders,
-                            FolderCapture::Filed {
-                                notebook: commit.notebook_id.clone(),
-                                folder: Some(folder_id.clone()),
-                            },
-                        ),
-                        Err(e) => eprintln!(
-                            "folder_membership_changed_failed notebook={} detail={e}",
-                            commit.notebook_id
-                        ),
-                    }
-                    x.ui.enter_notebook();
-                    install_active_notebook(x, ctrl).map_err(|e| {
-                        format!("FATAL: notebook create committed but open failed: {e}")
-                    })
-                }
-                Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
-                    x.ui.show_error("The notebook couldn't be created.");
-                    present_ui(x, ctrl, None)
-                }
-            }
+            create_notebook_from_ui(x, ctrl, &title, Some(&folder_id), &paper, None)
         }
         UiCommand::CreateNotebook(title) => {
             let paper = paper_background(&x.geo);
-            match create_notebook_durable(
-                x.library,
-                x.notebook_profile,
-                &x.geo,
-                &paper,
-                Some(&title),
-                &CreateNotebookHooks::default(),
-            ) {
-                Ok(commit) => {
-                    sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
-                    println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui",
-                        commit.notebook_id,
-                        commit.title,
-                        commit.manifest_persist_us,
-                        x.library.active_notebook_id()
-                    );
-                    x.ui.enter_notebook();
-                    install_active_notebook(x, ctrl).map_err(|e| {
-                        format!("FATAL: notebook create committed but open failed: {e}")
-                    })
-                }
-                Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
-                    x.ui.show_error("The notebook couldn't be created.");
-                    present_ui(x, ctrl, None)
-                }
-            }
+            create_notebook_from_ui(x, ctrl, &title, None, &paper, None)
         }
+        UiCommand::OpenTemplatePicker(purpose) => {
+            let entries = templates::list(x.library.root());
+            x.ui.open_template_picker(purpose, entries);
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::CreateNotebookWithTemplate {
+            title,
+            folder_id,
+            template,
+        } => match templates::bitmap(x.library.root(), &template, &x.geo) {
+            Ok(paper) => create_notebook_from_ui(
+                x,
+                ctrl,
+                &title,
+                folder_id.as_deref(),
+                &paper,
+                Some(template),
+            ),
+            Err(e) => {
+                eprintln!("template_load_failed template={template:?} detail={e}");
+                x.ui.show_error("That template couldn't be loaded.");
+                present_ui(x, ctrl, None)
+            }
+        },
         UiCommand::RenameNotebook { notebook_id, title } => {
             let ticket = if x.library.title(&notebook_id).ok() != Some(title.as_str()) {
                 match sync_prepare(|s| s.prepare_rename_notebook(&notebook_id, &title)) {
@@ -3602,10 +3635,37 @@ fn execute_ui_command(
                 ctrl,
                 x.notebook_profile,
                 x.current_bg,
+                None,
             )? {
                 x.ui.show_error("A page couldn't be inserted.");
             }
             // Success already reconstructed; a refusal must repaint the (closed) menu away.
+            if x.ui.modal_open() {
+                present_ui(x, ctrl, None)?;
+            }
+            Ok(())
+        }
+        UiCommand::InsertPageWithTemplate(template) => {
+            let bitmap = match templates::bitmap(x.library.root(), &template, &x.geo) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("template_load_failed template={template:?} detail={e}");
+                    x.ui.show_error("That template couldn't be loaded.");
+                    return present_ui(x, ctrl, None);
+                }
+            };
+            if insert_page_after_current(
+                x.notebook_dir,
+                x.manifest,
+                ctrl,
+                x.notebook_profile,
+                x.current_bg,
+                Some(&bitmap),
+            )? {
+                remember_template(x, template);
+            } else {
+                x.ui.show_error("A page couldn't be inserted.");
+            }
             if x.ui.modal_open() {
                 present_ui(x, ctrl, None)?;
             }
@@ -3979,6 +4039,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let prefs_path = prefs::preferences_path(cfg.sync_dir.as_deref(), cfg.device_dir.as_deref());
     ui.side_button = prefs::load_side_button(&prefs_path);
     ui.mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
+    ui.template = prefs::load_template(&prefs_path);
     println!("mirror_amazon_enabled={}", ui.mirror_enabled);
     if product_sync {
         ui.enable_sync();
@@ -4599,6 +4660,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                         &mut ctrl,
                         &notebook_profile,
                         &mut current_bg,
+                        None,
                     ),
                     DevNotebookOp::DeleteCurrent => delete_current_page(
                         &notebook_dir,

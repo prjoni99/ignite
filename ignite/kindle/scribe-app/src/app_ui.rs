@@ -18,11 +18,14 @@ use crate::fullscreen::NotebookChromeState;
 use crate::home::{home_rows, AppView, HomeCard, HomeHit, HomeLayout, HomeRow, HomeState};
 use crate::keyboard::{EditorKey, EditorOutcome, KeyboardLayout, TitleEditor};
 use crate::link_picker::LinkPickerState;
-use crate::modal::{dialog_spec, ButtonId, DialogLayout, Modal, TitlePurpose, PICKER_PAGE};
+use crate::modal::{
+    dialog_spec, ButtonId, DialogLayout, Modal, PickerPurpose, TitlePurpose, PICKER_PAGE,
+};
 use crate::prefs::SideButtonAction;
 use crate::server_link::LinkView;
 use crate::settings_ui::{PreferencesHit, PreferencesLayout, SettingsChromeHit};
 use crate::sync_ui::{SyncHit, SyncLayout};
+use crate::templates::{TemplateEntry, TemplateId, TemplateStatus};
 use crate::tools_ui::{ToolsHit, ToolsLayout, ToolsState};
 use crate::touch::FingerAction;
 use crate::ui_gfx::{Rect, UiPoint};
@@ -108,6 +111,16 @@ pub enum UiCommand {
         title: String,
         folder_id: String,
     },
+    /// List the page templates and open the picker ([`UiState::open_template_picker`]).
+    OpenTemplatePicker(PickerPurpose),
+    /// Create a notebook whose first page uses `template` (filed in `folder_id` when set).
+    CreateNotebookWithTemplate {
+        title: String,
+        folder_id: Option<String>,
+        template: TemplateId,
+    },
+    /// Insert a page after the current one with `template` as its background.
+    InsertPageWithTemplate(TemplateId),
     /// Cancel the link-target picker (no durable write).
     LinkPickerCancel,
     /// Open a notebook's page grid inside the picker (read-only).
@@ -160,6 +173,8 @@ pub(crate) fn mutates_open_notebook(cmd: &UiCommand) -> bool {
         cmd,
         UiCommand::Undo
             | UiCommand::InsertPageAfter
+            | UiCommand::OpenTemplatePicker(PickerPurpose::InsertPage)
+            | UiCommand::InsertPageWithTemplate(_)
             | UiCommand::MovePageLeft
             | UiCommand::MovePageRight
             | UiCommand::DeletePage
@@ -192,6 +207,8 @@ pub struct UiState {
     pub side_button: SideButtonAction,
     /// Replica-local Amazon mirror switch (`preferences.json`); the runtime's single source.
     pub mirror_enabled: bool,
+    /// Last used page template (`preferences.json`): the template picker preselects it.
+    pub template: TemplateId,
     /// `<library>/notebooks`, set by the runtime: a card menu checks the mirror marker here.
     pub notebooks_root: Option<std::path::PathBuf>,
     /// Link-target picker (only while `AppView::LinkTargetPicker`).
@@ -218,6 +235,7 @@ impl UiState {
             tools: ToolsState::default(),
             side_button: SideButtonAction::NavigationUndo,
             mirror_enabled: false,
+            template: TemplateId::default(),
             notebooks_root: None,
             link_picker: None,
             folders: Vec::new(),
@@ -286,6 +304,28 @@ impl UiState {
             options,
             page: 0,
         }
+    }
+
+    /// Open the template picker over `entries` (listed by the runtime when the command runs, so
+    /// taps never do I/O), on the page holding the last used template.
+    pub fn open_template_picker(&mut self, purpose: PickerPurpose, entries: Vec<TemplateEntry>) {
+        let selected = entries
+            .iter()
+            .position(|e| e.id == self.template)
+            .unwrap_or(0);
+        let unreadable = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e.status, TemplateStatus::Unreadable(_)))
+            .map(|(i, _)| i)
+            .collect();
+        self.modal = Some(Modal::TemplatePicker {
+            purpose,
+            options: entries.into_iter().map(|e| (e.id, e.name)).collect(),
+            selected,
+            page: selected / PICKER_PAGE,
+            unreadable,
+        });
     }
 
     /// D1: enable the SYNC entry point (product mode).
@@ -836,6 +876,53 @@ impl UiState {
                 });
                 UiCommand::Redraw(Redraw::Full)
             }
+            (
+                Modal::TemplatePicker {
+                    purpose,
+                    mut options,
+                    unreadable,
+                    ..
+                },
+                ButtonId::PickTemplate(k),
+            ) if k < options.len() && !unreadable.contains(&k) => {
+                let template = options.swap_remove(k).0;
+                self.template = template.clone();
+                match purpose {
+                    PickerPurpose::NewNotebook { title, folder_id } => {
+                        UiCommand::CreateNotebookWithTemplate {
+                            title,
+                            folder_id,
+                            template,
+                        }
+                    }
+                    PickerPurpose::InsertPage => UiCommand::InsertPageWithTemplate(template),
+                }
+            }
+            (
+                Modal::TemplatePicker {
+                    purpose,
+                    options,
+                    selected,
+                    page,
+                    unreadable,
+                },
+                ButtonId::PickerPrevious | ButtonId::PickerNext,
+            ) => {
+                let pages = options.len().div_ceil(PICKER_PAGE).max(1);
+                let page = if button == ButtonId::PickerNext {
+                    (page + 1).min(pages - 1)
+                } else {
+                    page.saturating_sub(1)
+                };
+                self.modal = Some(Modal::TemplatePicker {
+                    purpose,
+                    options,
+                    selected,
+                    page,
+                    unreadable,
+                });
+                UiCommand::Redraw(Redraw::Full)
+            }
             (Modal::NewChooser { notebook_title, .. }, ButtonId::NewNotebook) => {
                 self.modal = Some(Modal::TitleEntry {
                     purpose: TitlePurpose::Create,
@@ -868,6 +955,9 @@ impl UiState {
                 UiCommand::DeleteFolder(folder_id)
             }
             (Modal::PageMenu { .. }, ButtonId::InsertPageAfter) => UiCommand::InsertPageAfter,
+            (Modal::PageMenu { .. }, ButtonId::InsertPageWithTemplate) => {
+                UiCommand::OpenTemplatePicker(PickerPurpose::InsertPage)
+            }
             (Modal::PageMenu { .. }, ButtonId::MovePageLeft) => UiCommand::MovePageLeft,
             (Modal::PageMenu { .. }, ButtonId::MovePageRight) => UiCommand::MovePageRight,
             (
@@ -959,11 +1049,17 @@ impl UiState {
                 UiCommand::Redraw(Redraw::Full)
             }
             EditorOutcome::Submit(title) => match purpose {
-                TitlePurpose::Create => UiCommand::CreateNotebook(title),
+                TitlePurpose::Create => UiCommand::OpenTemplatePicker(PickerPurpose::NewNotebook {
+                    title,
+                    folder_id: None,
+                }),
                 TitlePurpose::ServerUrl => UiCommand::SyncManualUrl(title),
                 TitlePurpose::CreateFolder => UiCommand::CreateFolder(title),
                 TitlePurpose::CreateNotebookInFolder { folder_id } => {
-                    UiCommand::CreateNotebookInFolder { title, folder_id }
+                    UiCommand::OpenTemplatePicker(PickerPurpose::NewNotebook {
+                        title,
+                        folder_id: Some(folder_id),
+                    })
                 }
                 TitlePurpose::RenameFolder {
                     folder_id,
@@ -1156,6 +1252,8 @@ mod tests {
             UiCommand::DeletePage,
             UiCommand::RemoveLink { link_id },
             UiCommand::BeginCreateLink { x: 1.0, y: 2.0 },
+            UiCommand::OpenTemplatePicker(PickerPurpose::InsertPage),
+            UiCommand::InsertPageWithTemplate(crate::templates::TemplateId::default()),
             UiCommand::RenameNotebook {
                 notebook_id: "n".into(),
                 title: "t".into(),
@@ -1177,9 +1275,255 @@ mod tests {
             UiCommand::MirrorRescan,
             UiCommand::SetMirrorEnabled(true),
             UiCommand::DeleteNotebook("n".into()),
+            UiCommand::OpenTemplatePicker(PickerPurpose::NewNotebook {
+                title: "t".into(),
+                folder_id: None,
+            }),
+            UiCommand::CreateNotebookWithTemplate {
+                title: "t".into(),
+                folder_id: None,
+                template: crate::templates::TemplateId::default(),
+            },
         ] {
             assert!(!mutates_open_notebook(&cmd), "{cmd:?}");
         }
+    }
+
+    fn template_entries() -> Vec<crate::templates::TemplateEntry> {
+        use crate::templates::{TemplateEntry, TemplateId, TemplateStatus};
+        let mut v: Vec<TemplateEntry> = ["Blank", "Lined", "Dotted", "Grid", "Cornell", "Planner"]
+            .iter()
+            .map(|n| TemplateEntry {
+                id: TemplateId::Builtin {
+                    id: n.to_lowercase(),
+                },
+                name: (*n).into(),
+                status: TemplateStatus::Ready,
+            })
+            .collect();
+        v.push(TemplateEntry {
+            id: TemplateId::Custom {
+                name: "broken".into(),
+            },
+            name: "broken".into(),
+            status: TemplateStatus::Unreadable("bad png".into()),
+        });
+        v.push(TemplateEntry {
+            id: TemplateId::Custom {
+                name: "grid-big".into(),
+            },
+            name: "grid-big".into(),
+            status: TemplateStatus::Ready,
+        });
+        v
+    }
+
+    fn picker_labels(ui: &UiState) -> Vec<(String, bool)> {
+        dialog_spec(ui.modal.as_ref().unwrap())
+            .unwrap()
+            .buttons
+            .into_iter()
+            .map(|b| (b.label, b.enabled))
+            .collect()
+    }
+
+    fn tap_dialog(ui: &mut UiState, g: &FbGeometry, label: &str) -> UiCommand {
+        let spec = dialog_spec(ui.modal.as_ref().unwrap()).unwrap();
+        let (_, r) = DialogLayout::new(g, &spec)
+            .buttons
+            .into_iter()
+            .find(|(b, _)| b.label == label)
+            .unwrap_or_else(|| panic!("no button {label}"));
+        let p = UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        ui.on_tap(g, p, &[], "Notebook 3", None)
+    }
+
+    fn submit_title(ui: &mut UiState, g: &FbGeometry) -> UiCommand {
+        let Some(Modal::TitleEntry { editor, .. }) = ui.modal.as_ref() else {
+            panic!("expected title entry");
+        };
+        let layout = KeyboardLayout::new(g, editor.symbols());
+        let (_, r) = layout
+            .keys
+            .iter()
+            .find(|(k, _)| *k == EditorKey::Submit)
+            .unwrap();
+        let p = UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        ui.on_tap(g, p, &[], "Notebook 3", None)
+    }
+
+    #[test]
+    fn title_submit_opens_the_template_picker_on_the_last_used_template() {
+        use crate::templates::TemplateId;
+        let g = crate::ui_gfx::panel_geo();
+        let mut ui = UiState::launch_home(0, 2);
+        assert_eq!(ui.template, TemplateId::default());
+        ui.template = TemplateId::Custom {
+            name: "grid-big".into(),
+        };
+
+        ui.modal = Some(Modal::TitleEntry {
+            purpose: TitlePurpose::Create,
+            editor: TitleEditor::new("Work"),
+        });
+        let new_main = PickerPurpose::NewNotebook {
+            title: "Work".into(),
+            folder_id: None,
+        };
+        assert_eq!(
+            submit_title(&mut ui, &g),
+            UiCommand::OpenTemplatePicker(new_main.clone())
+        );
+        assert!(ui.modal.is_none());
+
+        ui.modal = Some(Modal::TitleEntry {
+            purpose: TitlePurpose::CreateNotebookInFolder {
+                folder_id: "folder-1".into(),
+            },
+            editor: TitleEditor::new("Trip"),
+        });
+        assert_eq!(
+            submit_title(&mut ui, &g),
+            UiCommand::OpenTemplatePicker(PickerPurpose::NewNotebook {
+                title: "Trip".into(),
+                folder_id: Some("folder-1".into()),
+            })
+        );
+
+        // The runtime lists the templates and opens the picker on the page of the last used.
+        ui.open_template_picker(new_main.clone(), template_entries());
+        match ui.modal.as_ref() {
+            Some(Modal::TemplatePicker {
+                purpose,
+                options,
+                selected,
+                page,
+                ..
+            }) => {
+                assert_eq!(purpose, &new_main);
+                assert_eq!(options.len(), 8);
+                assert_eq!(*selected, 7);
+                assert_eq!(*page, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            picker_labels(&ui),
+            vec![
+                ("Planner".to_string(), true),
+                ("broken".to_string(), false),
+                ("grid-big \u{2713}".to_string(), true),
+                ("PREVIOUS".to_string(), true),
+                ("NEXT".to_string(), false),
+                ("CANCEL".to_string(), true),
+            ]
+        );
+
+        // A last-used template that no longer exists selects the first option.
+        ui.template = TemplateId::Custom {
+            name: "gone".into(),
+        };
+        ui.open_template_picker(new_main, template_entries());
+        let labels = picker_labels(&ui);
+        assert_eq!(labels[0], ("Blank \u{2713}".to_string(), true));
+        assert_eq!(labels[1], ("Lined".to_string(), true));
+        assert_eq!(labels.len(), 8);
+    }
+
+    #[test]
+    fn pick_template_creates_with_that_template_and_remembers_it() {
+        use crate::templates::TemplateId;
+        let g = crate::ui_gfx::panel_geo();
+        let mut ui = UiState::launch_home(0, 2);
+        let purpose = PickerPurpose::NewNotebook {
+            title: "Trip".into(),
+            folder_id: Some("folder-1".into()),
+        };
+        ui.open_template_picker(purpose.clone(), template_entries());
+
+        // Paging keeps the picker open; a disabled (unreadable) option is inert.
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "NEXT"),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::TemplatePicker { page: 1, .. })
+        ));
+        assert_eq!(tap_dialog(&mut ui, &g, "broken"), UiCommand::None);
+        assert!(ui.modal.is_some());
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "PREVIOUS"),
+            UiCommand::Redraw(Redraw::Full)
+        );
+
+        let lined = TemplateId::Builtin { id: "lined".into() };
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "Lined"),
+            UiCommand::CreateNotebookWithTemplate {
+                title: "Trip".into(),
+                folder_id: Some("folder-1".into()),
+                template: lined.clone(),
+            }
+        );
+        assert!(ui.modal.is_none());
+        assert_eq!(ui.template, lined);
+
+        // Reopening preselects it.
+        ui.open_template_picker(purpose, template_entries());
+        assert_eq!(picker_labels(&ui)[1], ("Lined \u{2713}".to_string(), true));
+
+        // CANCEL discards the title and creates nothing.
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "CANCEL"),
+            UiCommand::Redraw(Redraw::Full)
+        );
+        assert!(ui.modal.is_none());
+        assert_eq!(ui.template, lined);
+
+        // Insert purpose emits the insert command.
+        ui.open_template_picker(PickerPurpose::InsertPage, template_entries());
+        let grid = TemplateId::Builtin { id: "grid".into() };
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "Grid"),
+            UiCommand::InsertPageWithTemplate(grid.clone())
+        );
+        assert!(ui.modal.is_none());
+        assert_eq!(ui.template, grid);
+    }
+
+    #[test]
+    fn page_menu_offers_insert_page_with_template() {
+        let g = crate::ui_gfx::panel_geo();
+        let mut ui = UiState::launch_home(0, 1);
+        ui.enter_notebook();
+        ui.show_modal(Modal::PageMenu {
+            page_number: 2,
+            page_count: 3,
+        });
+        let labels: Vec<String> = picker_labels(&ui).into_iter().map(|(l, _)| l).collect();
+        assert_eq!(
+            labels,
+            [
+                "INSERT PAGE AFTER",
+                "INSERT PAGE WITH TEMPLATE",
+                "MOVE PAGE LEFT",
+                "MOVE PAGE RIGHT",
+                "DELETE PAGE",
+                "CANCEL"
+            ]
+        );
+        assert_eq!(
+            tap_dialog(&mut ui, &g, "INSERT PAGE WITH TEMPLATE"),
+            UiCommand::OpenTemplatePicker(PickerPurpose::InsertPage)
+        );
+        assert!(ui.modal.is_none());
     }
 
     #[test]
