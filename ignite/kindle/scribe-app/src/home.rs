@@ -21,7 +21,7 @@ pub use crate::folders::FolderInfo;
 pub const ROWS_PER_PAGE: usize = 6;
 
 const MARGIN: u32 = 60;
-/// Compact top bar: [exit] [search placeholder] [today] [sync] [+ new] [tools]. Every control keeps a
+/// Compact top bar: [exit] [search placeholder] [capture] [today] [sync] [+ new] [tools]. Every control keeps a
 /// >= 130 px (about 11 mm) pen/finger target.
 const BAR_Y: u32 = 36;
 const BAR_H: u32 = 130;
@@ -34,6 +34,10 @@ const SYNC_W: u32 = 230;
 const TOOLS_W: u32 = BAR_H;
 /// Today's daily page, left of Sync (or of "+ NEW" without sync).
 const TODAY_W: u32 = NEW_W;
+/// Quick capture into the Inbox, left of Today.
+const CAPTURE_W: u32 = TODAY_W;
+/// `CAPTURE` is wider than `TODAY`: one step smaller so it fits the same tile.
+const CAPTURE_SCALE: u32 = 6;
 const DIVIDER_Y: u32 = 196;
 const CARDS_TOP: u32 = 232;
 const CARD_GAP: u32 = 24;
@@ -271,6 +275,8 @@ pub enum HomeHit {
     Tools,
     /// Open (creating as needed) today's daily page.
     Today,
+    /// Open a fresh page in the Inbox (creating it as needed).
+    Capture,
     /// Search placeholder: consumed, does nothing (search is not implemented yet).
     SearchPlaceholder,
 }
@@ -289,6 +295,8 @@ pub struct HomeLayout {
     pub tools_button: Rect,
     /// Today's daily page, left of `sync_button` (of `new_button` without sync).
     pub today_button: Rect,
+    /// Quick capture, left of `today_button`.
+    pub capture_button: Rect,
     /// `(library index, card rect, menu rect)` for the visible viewport page.
     pub cards: Vec<(usize, Rect, Rect)>,
     /// `(folder index, tile rect, menu rect)` for the visible viewport page.
@@ -366,8 +374,14 @@ impl HomeLayout {
         }
         .saturating_sub(BAR_GAP);
         let today_button = Rect::new(today_right.saturating_sub(TODAY_W), BAR_Y, TODAY_W, BAR_H);
+        let capture_button = Rect::new(
+            today_button.x.saturating_sub(BAR_GAP + CAPTURE_W),
+            BAR_Y,
+            CAPTURE_W,
+            BAR_H,
+        );
         let search_left = exit_hit.right() + BAR_GAP;
-        let search_right = today_button.x.saturating_sub(BAR_GAP);
+        let search_right = capture_button.x.saturating_sub(BAR_GAP);
         let search = Rect::new(
             search_left,
             BAR_Y,
@@ -382,6 +396,7 @@ impl HomeLayout {
             sync_button,
             tools_button,
             today_button,
+            capture_button,
             cards,
             folders,
             rows_len: all.len(),
@@ -418,6 +433,9 @@ impl HomeLayout {
         }
         if self.today_button.contains(p.x, p.y) {
             return Some(HomeHit::Today);
+        }
+        if self.capture_button.contains(p.x, p.y) {
+            return Some(HomeHit::Capture);
         }
         if self.search.contains(p.x, p.y) {
             return Some(HomeHit::SearchPlaceholder);
@@ -624,6 +642,13 @@ pub fn render_home_view(
     }
     c.frame(layout.today_button, 4, BLACK);
     c.text_centered(layout.today_button.inset(8), 8, "TODAY", BLACK);
+    c.frame(layout.capture_button, 4, BLACK);
+    c.text_centered(
+        layout.capture_button.inset(8),
+        CAPTURE_SCALE,
+        "CAPTURE",
+        BLACK,
+    );
     c.fill(layout.new_button, BLACK);
     c.text_centered(layout.new_button.inset(8), 8, "+ NEW", WHITE);
     c.frame(layout.tools_button, 4, BLACK);
@@ -900,5 +925,56 @@ mod tests {
         assert!(!AppView::Preferences.allows_page_input());
         assert!(!AppView::LinkTargetPicker.allows_page_input());
         assert!(!AppView::Sync.allows_page_input());
+    }
+
+    #[test]
+    fn home_layout_has_a_capture_tile() {
+        let g = panel_geo();
+        let c = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let disjoint = |a: Rect, b: Rect| a.right() <= b.x || b.right() <= a.x;
+        for sync in [true, false] {
+            let mut st = HomeState::selecting(0, 3);
+            st.sync = sync;
+            let l = HomeLayout::new(&g, &st, 3);
+            let k = l.capture_button;
+            assert_eq!((k.y, k.h, k.w), (l.today_button.y, BAR_H, CAPTURE_W));
+            assert_eq!(CAPTURE_W, TODAY_W);
+            // [search] [capture] [today] ...
+            assert_eq!(k.right() + BAR_GAP, l.today_button.x);
+            assert_eq!(l.search.right() + BAR_GAP, k.x);
+            let mut bar = vec![
+                l.exit_hit,
+                l.search,
+                k,
+                l.today_button,
+                l.new_button,
+                l.tools_button,
+            ];
+            if sync {
+                bar.push(l.sync_button);
+            }
+            for (i, a) in bar.iter().enumerate() {
+                assert!(a.w >= 130 && a.h >= 130, "{a:?}");
+                for b in &bar[i + 1..] {
+                    assert!(disjoint(*a, *b), "{a:?} overlaps {b:?}");
+                }
+            }
+            assert_eq!(l.hit(c(k), &st, 3), Some(HomeHit::Capture));
+            assert_eq!(l.hit(c(l.today_button), &st, 3), Some(HomeHit::Today));
+            assert_eq!(l.hit(c(l.search), &st, 3), Some(HomeHit::SearchPlaceholder));
+        }
+        // Painted with its label.
+        let mut st = HomeState::selecting(0, 0);
+        st.sync = true;
+        let mut fb = vec![0x55; g.smem_len as usize];
+        render_home_view(&mut fb, &g, &[], &[], None, &st).unwrap();
+        let k = HomeLayout::new(&g, &st, 0).capture_button.inset(12);
+        let inked = (k.y..k.bottom())
+            .any(|y| (k.x..k.right()).any(|x| fb[(y * g.line_length + x) as usize] != WHITE));
+        assert!(inked, "CAPTURE label painted");
+        assert!(crate::ui_gfx::text_width("CAPTURE", CAPTURE_SCALE) <= CAPTURE_W - 16);
     }
 }

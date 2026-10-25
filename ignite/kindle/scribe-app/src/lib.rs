@@ -8,6 +8,7 @@
 pub mod app_ui;
 mod background_identity_tests;
 pub mod cadence;
+pub mod capture;
 pub mod chrome;
 #[cfg(unix)]
 pub mod clock;

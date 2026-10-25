@@ -99,7 +99,11 @@ pub fn classify_nav_down(side_button_held: bool, page: PagePoint) -> Option<NavD
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SideButtonDispatch {
     Nav(NavDownAction),
-    CreateLink { page: PagePoint },
+    CreateLink {
+        page: PagePoint,
+    },
+    /// Quick capture (or return from the Inbox); consumes the whole page like `CreateLink`.
+    Capture,
 }
 
 /// Route an already-decoded BTN_STYLUS + Pen Down into the configured action.
@@ -119,6 +123,7 @@ pub fn dispatch_side_button(
             classify_nav_down(true, page).map(SideButtonDispatch::Nav)
         }
         SideButtonAction::CreateLink => Some(SideButtonDispatch::CreateLink { page }),
+        SideButtonAction::Capture => Some(SideButtonDispatch::Capture),
     }
 }
 
@@ -314,5 +319,34 @@ mod tests {
             dispatch_side_button(SideButtonAction::CreateLink, true, edge).unwrap(),
             SideButtonDispatch::Nav(NavDownAction::Prev)
         );
+    }
+
+    #[test]
+    fn capture_dispatch_is_a_no_op_without_a_page_and_returns_from_inbox() {
+        let center = PagePoint::new(CANONICAL_WIDTH / 2.0, 100.0);
+        let edge = PagePoint::new(10.0, 0.0);
+        for p in [center, edge] {
+            assert_eq!(
+                dispatch_side_button(SideButtonAction::Capture, false, p),
+                None
+            );
+            // Consumes the whole page like CreateLink: never edge nav or undo.
+            assert_eq!(
+                dispatch_side_button(SideButtonAction::Capture, true, p),
+                Some(SideButtonDispatch::Capture)
+            );
+        }
+        // From an Inbox page the same gesture returns; elsewhere it captures.
+        assert_eq!(
+            crate::capture::capture_command_for(true),
+            crate::app_ui::UiCommand::CaptureReturn
+        );
+        assert_eq!(
+            crate::capture::capture_command_for(false),
+            crate::app_ui::UiCommand::Capture
+        );
+        assert!(crate::capture::should_discard_on_leave(0, 2));
+        assert!(!crate::capture::should_discard_on_leave(0, 1));
+        assert!(!crate::capture::should_discard_on_leave(3, 2));
     }
 }

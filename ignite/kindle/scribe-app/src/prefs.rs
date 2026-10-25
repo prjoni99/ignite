@@ -24,6 +24,8 @@ pub enum SideButtonAction {
     NavigationUndo,
     /// Capture the tap point and open the link-target picker.
     CreateLink,
+    /// Open a fresh Inbox page (on an Inbox page: return to where the capture started).
+    Capture,
 }
 
 /// Where Ignite goes when it starts.
@@ -338,5 +340,20 @@ mod tests {
             preferences_path(None, None),
             PathBuf::from(DEFAULT_REPLICA_STATE_DIR).join(PREFERENCES_FILE)
         );
+    }
+
+    #[test]
+    fn side_button_capture_round_trips() {
+        let p = temp_path("capture");
+        save_side_button(&p, SideButtonAction::Capture).unwrap();
+        assert_eq!(load_side_button(&p), SideButtonAction::Capture);
+        let raw = fs::read_to_string(&p).unwrap();
+        assert!(raw.contains(r#""side_button": "capture""#), "{raw}");
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"capture"}"#).side_button,
+            SideButtonAction::Capture
+        );
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir(p.parent().unwrap());
     }
 }

@@ -87,6 +87,12 @@ pub enum UiCommand {
     SetOpenAtLaunch(OpenAtLaunch),
     /// Home TODAY: open (creating as needed) today's daily page.
     OpenToday,
+    /// Home CAPTURE / side button: open a fresh stamped page in the Inbox (creating it as
+    /// needed), remembering the page it came from.
+    Capture,
+    /// Side button on an Inbox page: discard it if empty, then go back where the capture
+    /// started (Home when nothing is remembered).
+    CaptureReturn,
     /// Tools: scan the Kindle's notebooks (read-only).
     ToolsScan,
     /// Tools: import every eligible Kindle notebook (one-way copy).
@@ -561,6 +567,7 @@ impl UiState {
             Some(HomeHit::Sync) => Some(UiCommand::OpenSync),
             Some(HomeHit::Tools) => Some(UiCommand::OpenTools),
             Some(HomeHit::Today) => Some(UiCommand::OpenToday),
+            Some(HomeHit::Capture) => Some(UiCommand::Capture),
             _ => None,
         };
         if let Some(cmd) = cmd {
@@ -573,7 +580,8 @@ impl UiState {
             | Some(HomeHit::Exit)
             | Some(HomeHit::Sync)
             | Some(HomeHit::Tools)
-            | Some(HomeHit::Today) => UiCommand::None,
+            | Some(HomeHit::Today)
+            | Some(HomeHit::Capture) => UiCommand::None,
             Some(HomeHit::Back) => {
                 // Back to the main list, showing the folder just left.
                 self.home_folder = None;
@@ -676,6 +684,7 @@ impl UiState {
             Some(PreferencesHit::CreateLink) => {
                 UiCommand::SetSideButton(SideButtonAction::CreateLink)
             }
+            Some(PreferencesHit::Capture) => UiCommand::SetSideButton(SideButtonAction::Capture),
             Some(PreferencesHit::MirrorToggle) => UiCommand::SetMirrorEnabled(!self.mirror_enabled),
             Some(PreferencesHit::LaunchHome) => UiCommand::SetOpenAtLaunch(OpenAtLaunch::Home),
             Some(PreferencesHit::LaunchToday) => UiCommand::SetOpenAtLaunch(OpenAtLaunch::Today),
@@ -1394,6 +1403,32 @@ mod tests {
         assert_eq!(
             ui.on_tap(&g, center(l.launch_home), &[], "Notebook 1", None),
             UiCommand::SetOpenAtLaunch(OpenAtLaunch::Home)
+        );
+    }
+
+    #[test]
+    fn capture_tile_and_side_button_choice_resolve_to_commands() {
+        use crate::prefs::SideButtonAction;
+        let g = crate::ui_gfx::panel_geo();
+        let center = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let mut ui = UiState::launch_home(0, 0);
+        let capture = HomeLayout::new(&g, &ui.home, 0).capture_button;
+        let before = ui.clone();
+        assert_eq!(
+            ui.on_tap(&g, center(capture), &[], "Notebook 1", None),
+            UiCommand::Capture
+        );
+        assert_eq!(ui, before, "the tile changes no Home state");
+        assert!(!mutates_open_notebook(&UiCommand::Capture));
+        assert!(!mutates_open_notebook(&UiCommand::CaptureReturn));
+        ui.enter_preferences();
+        let l = PreferencesLayout::new(&g);
+        assert_eq!(
+            ui.on_tap(&g, center(l.capture), &[], "Notebook 1", None),
+            UiCommand::SetSideButton(SideButtonAction::Capture)
         );
     }
 
