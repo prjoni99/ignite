@@ -2384,16 +2384,24 @@ fn refresh_tools_mirror(
     ui: &mut UiState,
     library_root: &Path,
     run: Option<&crate::mirror::MirrorRun>,
+    clock: &crate::mirror::MirrorClock,
 ) {
-    let queued = run.map_or(0, |r| r.queue.len());
+    let live = crate::mirror::MirrorLive {
+        enabled: ui.mirror_enabled,
+        sync_linked: crate::sync_outbound::with_global(|_| ()).is_some(),
+        queued: run.map_or(0, |r| r.queue.len()),
+        skipped: clock.last_skipped,
+    };
     let now = crate::mirror::unix_now_ms();
     ui.tools.mirror = match crate::mirror::MirrorLedger::open(library_root) {
-        Ok(ledger) => crate::mirror::summary(&ledger, ui.mirror_enabled, queued, now),
+        Ok(ledger) => crate::mirror::summary(&ledger, live, now),
         Err(e) => {
             eprintln!("mirror_summary_failed detail={e}");
             crate::mirror::MirrorSummary {
-                enabled: ui.mirror_enabled,
-                pending: queued,
+                enabled: live.enabled,
+                sync_linked: live.sync_linked,
+                skipped: live.skipped,
+                pending: live.queued,
                 last_scan_error: Some(e),
                 now_unix_ms: now,
                 ..Default::default()
@@ -2546,7 +2554,7 @@ fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
             );
             *x.mirror_run = None;
             if x.ui.view == AppView::Tools && !x.ui.modal_open() {
-                refresh_tools_mirror(x.ui, x.library.root(), None);
+                refresh_tools_mirror(x.ui, x.library.root(), None, x.mirror_clock);
                 return present_ui(x, ctrl, None);
             }
             return Ok(());
@@ -2563,7 +2571,12 @@ fn mirror_step(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> 
     }
     // Tools shows the mirror's progress: refresh it after every step.
     if x.ui.view == AppView::Tools && !x.ui.modal_open() {
-        refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+        refresh_tools_mirror(
+            x.ui,
+            x.library.root(),
+            x.mirror_run.as_ref(),
+            x.mirror_clock,
+        );
         return present_ui(x, ctrl, None);
     }
     Ok(())
@@ -3345,13 +3358,23 @@ fn execute_ui_command(
         UiCommand::Redraw(Redraw::Region(r)) => present_ui(x, ctrl, Some(r)),
         UiCommand::OpenTools => {
             x.ui.enter_tools();
-            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+            refresh_tools_mirror(
+                x.ui,
+                x.library.root(),
+                x.mirror_run.as_ref(),
+                x.mirror_clock,
+            );
             println!("app_view=tools");
             present_ui(x, ctrl, None)
         }
         UiCommand::ShowToolsTab => {
             x.ui.show_tools_tab();
-            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+            refresh_tools_mirror(
+                x.ui,
+                x.library.root(),
+                x.mirror_run.as_ref(),
+                x.mirror_clock,
+            );
             println!("app_view=tools tab=tools");
             present_ui(x, ctrl, None)
         }
@@ -3359,7 +3382,12 @@ fn execute_ui_command(
             // The scan itself runs at the next structural safe point (same gate as always).
             x.mirror_clock.last_scan = None;
             println!("mirror_rescan_requested=true");
-            refresh_tools_mirror(x.ui, x.library.root(), x.mirror_run.as_ref());
+            refresh_tools_mirror(
+                x.ui,
+                x.library.root(),
+                x.mirror_run.as_ref(),
+                x.mirror_clock,
+            );
             present_ui(x, ctrl, None)
         }
         UiCommand::SetMirrorEnabled(enabled) => {
@@ -4581,11 +4609,13 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                         ) {
                             Ok(r) => {
                                 println!(
-                                    "mirror_scan actions={} current={} unsupported={}",
+                                    "mirror_scan actions={} current={} unsupported={} skipped={}",
                                     r.actions.len(),
                                     r.current,
-                                    r.unsupported.len()
+                                    r.unsupported.len(),
+                                    r.skipped
                                 );
+                                mirror_clock.last_skipped = r.skipped;
                                 if !r.actions.is_empty() {
                                     mirror_run = Some(crate::mirror::MirrorRun {
                                         queue: r.actions.into(),
@@ -4607,7 +4637,12 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                         Err(e) => eprintln!("mirror_scan_failed detail={e}"),
                     }
                     if ui.view == AppView::Tools {
-                        refresh_tools_mirror(&mut ui, library.root(), mirror_run.as_ref());
+                        refresh_tools_mirror(
+                            &mut ui,
+                            library.root(),
+                            mirror_run.as_ref(),
+                            &mirror_clock,
+                        );
                         pending_ui = Some(UiCommand::Redraw(Redraw::Full));
                     }
                     continue;

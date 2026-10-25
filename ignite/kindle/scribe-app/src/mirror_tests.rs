@@ -358,6 +358,7 @@ fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
         last_scan: Some(Instant::now()),
         last_batches: 3,
         recovery_done: false,
+        last_skipped: 0,
     };
     assert!(apply_mirror_toggle(false, &mut run, &mut clock));
     assert!(run.is_none());
@@ -1508,12 +1509,14 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
         last_scan: None,
         last_batches: 0,
         recovery_done: false,
+        last_skipped: 0,
     };
     assert!(scan_due(&launch, t0, 0));
     let after = MirrorClock {
         last_scan: Some(t0),
         last_batches: 3,
         recovery_done: false,
+        last_skipped: 0,
     };
     assert!(!scan_due(&after, t0, 3));
     assert!(!scan_due(&after, t0 + Duration::from_secs(60), 3));
@@ -1641,11 +1644,19 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
         path: PathBuf::new(),
         data,
     };
-    let s = summary(&ledger, true, 2, 181_000);
+    let live = MirrorLive {
+        enabled: true,
+        sync_linked: true,
+        queued: 2,
+        skipped: 1,
+    };
+    let s = summary(&ledger, live, 181_000);
     assert_eq!(
         s,
         MirrorSummary {
             enabled: true,
+            sync_linked: true,
+            skipped: 1,
             current: 2,
             // One Rebuilding entry plus two queued actions.
             pending: 3,
@@ -1660,7 +1671,7 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
         data: MirrorLedgerV1::default(),
     };
     assert_eq!(
-        summary(&empty, false, 0, 5),
+        summary(&empty, MirrorLive::default(), 5),
         MirrorSummary {
             now_unix_ms: 5,
             ..MirrorSummary::default()

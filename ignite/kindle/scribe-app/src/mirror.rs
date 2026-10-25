@@ -1060,6 +1060,8 @@ pub struct MirrorClock {
     pub last_batches: u64,
     /// [`recover_interrupted`] has run (or been attempted) this process.
     pub recovery_done: bool,
+    /// Listed sources the last completed scan skipped ([`MirrorScan::skipped`]).
+    pub last_skipped: usize,
 }
 
 /// Should crash recovery run now? Once per process, and only once sync is linked, so the
@@ -1116,6 +1118,11 @@ pub fn scan_allowed(view: AppView, import_running: bool, sync_linked: bool) -> b
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MirrorSummary {
     pub enabled: bool,
+    /// Sync is installed, so scans and rebuilds may run; `enabled && !sync_linked` shows as
+    /// `on (waiting for sync)`.
+    pub sync_linked: bool,
+    /// Listed sources the last scan skipped (directory or `nbk` missing, or not a directory).
+    pub skipped: usize,
     /// Ledger entries in step with Amazon.
     pub current: usize,
     /// `Rebuilding` entries plus actions still queued in the running pass.
@@ -1128,19 +1135,26 @@ pub struct MirrorSummary {
     pub now_unix_ms: u64,
 }
 
-/// Summarize the ledger for the Tools screen. `queued` is the running pass's queue length.
-pub fn summary(
-    ledger: &MirrorLedger,
-    enabled: bool,
-    queued: usize,
-    now_unix_ms: u64,
-) -> MirrorSummary {
+/// What the runtime knows about the mirror beyond the ledger: the toggle, whether sync is
+/// linked, the running pass's queue length and the last scan's skipped count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MirrorLive {
+    pub enabled: bool,
+    pub sync_linked: bool,
+    pub queued: usize,
+    pub skipped: usize,
+}
+
+/// Summarize the ledger for the Tools screen.
+pub fn summary(ledger: &MirrorLedger, live: MirrorLive, now_unix_ms: u64) -> MirrorSummary {
     let d = &ledger.data;
     let count = |s: MirrorState| d.entries.values().filter(|e| e.state == s).count();
     MirrorSummary {
-        enabled,
+        enabled: live.enabled,
+        sync_linked: live.sync_linked,
+        skipped: live.skipped,
         current: count(MirrorState::Current),
-        pending: count(MirrorState::Rebuilding) + queued,
+        pending: count(MirrorState::Rebuilding) + live.queued,
         last_scan_unix_ms: d.last_scan_unix_ms,
         last_scan_error: d.last_scan_error.clone(),
         unsupported: d

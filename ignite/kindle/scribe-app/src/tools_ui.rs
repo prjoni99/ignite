@@ -182,20 +182,30 @@ fn ago(ms: u64) -> String {
     }
 }
 
-/// The Amazon mirror block: one summary line, the last scan error, then unsupported notebooks.
+/// The Amazon mirror block: one summary line, the last scan error, the last scan's skipped
+/// sources, then unsupported notebooks.
 pub fn mirror_lines(m: &MirrorSummary) -> Vec<String> {
     let last = match m.last_scan_unix_ms {
         Some(t) => ago(m.now_unix_ms.saturating_sub(t)),
         None => "never".into(),
     };
+    let state = match (m.enabled, m.sync_linked) {
+        (false, _) => "off",
+        (true, true) => "on",
+        (true, false) => "on (waiting for sync)",
+    };
     let mut lines = vec![format!(
-        "Amazon mirror: {}, {} current, {} pending, last scan {last}",
-        if m.enabled { "on" } else { "off" },
-        m.current,
-        m.pending
+        "Amazon mirror: {state}, {} current, {} pending, last scan {last}",
+        m.current, m.pending
     )];
     if let Some(e) = &m.last_scan_error {
         lines.push(format!("last scan failed: {e}"));
+    }
+    if m.skipped > 0 {
+        lines.push(format!(
+            "last scan skipped {} listed but missing on disk",
+            m.skipped
+        ));
     }
     for (title, error) in m.unsupported.iter().take(MAX_FAILURE_LINES) {
         lines.push(format!("{title}: {}", failure_reason(error)));
@@ -463,6 +473,8 @@ mod tests {
         let now = 10_000_000;
         MirrorSummary {
             enabled,
+            sync_linked: true,
+            skipped: 0,
             current: 12,
             pending: 1,
             last_scan_unix_ms: last_scan_age_ms.map(|a| now - a),
@@ -498,6 +510,21 @@ mod tests {
             lines.last().unwrap(),
             "Amazon mirror: off, 0 current, 0 pending, last scan never"
         );
+        // On but sync not linked (off, faulted or not yet paired): nothing runs until it is.
+        let (_, lines) = status_lines(&with_mirror(MirrorSummary {
+            sync_linked: false,
+            ..mirror(true, None)
+        }));
+        assert_eq!(
+            lines.last().unwrap(),
+            "Amazon mirror: on (waiting for sync), 12 current, 1 pending, last scan never"
+        );
+        // Off wins over unlinked.
+        let lines = mirror_lines(&MirrorSummary {
+            sync_linked: false,
+            ..mirror(false, None)
+        });
+        assert!(lines[0].starts_with("Amazon mirror: off,"), "{}", lines[0]);
         for (age, text) in [
             (0, "last scan 0s ago"),
             (59_999, "last scan 59s ago"),
@@ -512,9 +539,26 @@ mod tests {
     }
 
     #[test]
+    fn mirror_block_shows_the_skipped_count_only_when_nonzero() {
+        assert_eq!(mirror_lines(&mirror(true, Some(1_000))).len(), 1);
+        let lines = mirror_lines(&MirrorSummary {
+            skipped: 2,
+            ..mirror(true, Some(1_000))
+        });
+        assert_eq!(
+            lines,
+            vec![
+                "Amazon mirror: on, 12 current, 1 pending, last scan 1s ago".to_string(),
+                "last scan skipped 2 listed but missing on disk".into(),
+            ]
+        );
+    }
+
+    #[test]
     fn mirror_block_shows_the_scan_error_and_at_most_five_unsupported() {
         let m = MirrorSummary {
             last_scan_error: Some("Kindle catalog: locked".into()),
+            skipped: 1,
             unsupported: (0..6)
                 .map(|i| (format!("Notebook {i}"), "NBK_UNSUPPORTED: v9".to_string()))
                 .collect(),
@@ -527,6 +571,7 @@ mod tests {
             vec![
                 "Amazon mirror: on, 12 current, 1 pending, last scan 1s ago",
                 "last scan failed: Kindle catalog: locked",
+                "last scan skipped 1 listed but missing on disk",
                 "Notebook 0: format not supported",
                 "Notebook 1: format not supported",
                 "Notebook 2: format not supported",
