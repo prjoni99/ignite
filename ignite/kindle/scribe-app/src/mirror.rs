@@ -132,7 +132,13 @@ pub struct MirrorLedgerV1 {
 pub struct MirrorLedger {
     path: PathBuf,
     pub data: MirrorLedgerV1,
+    /// `last_scan_unix_ms` as last written to disk (see [`MirrorLedger::note_scan_at`]).
+    scan_persisted_ms: Option<u64>,
 }
+
+/// A scan that changed nothing is written to the ledger at most this often; the in-memory
+/// time stays exact and the Tools block reads it from [`MirrorClock`].
+pub const SCAN_NOTE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -163,7 +169,11 @@ impl MirrorLedger {
             },
             Err(e) => return Err(format!("REFUSE MIRROR: read mirror ledger: {e}")),
         };
-        Ok(Self { path, data })
+        Ok(Self {
+            path,
+            scan_persisted_ms: data.last_scan_unix_ms,
+            data,
+        })
     }
 
     /// Apply `f`, persist atomically, and restore the previous in-memory state if the write
@@ -178,6 +188,7 @@ impl MirrorLedger {
             self.data = prev;
             return Err(format!("mirror ledger write: {e}"));
         }
+        self.scan_persisted_ms = self.data.last_scan_unix_ms;
         Ok(())
     }
 
@@ -205,12 +216,28 @@ impl MirrorLedger {
         })
     }
 
-    /// Record a scan attempt now, with its error if it failed.
-    pub fn note_scan(&mut self, error: Option<String>) -> Result<(), String> {
-        self.commit(|d| {
-            d.last_scan_unix_ms = Some(now_ms());
-            d.last_scan_error = error;
-        })
+    /// Record a scan attempt now, with its error if it failed. See [`Self::note_scan_at`].
+    pub fn note_scan(&mut self, error: Option<String>) -> Result<bool, String> {
+        self.note_scan_at(now_ms(), error)
+    }
+
+    /// Record a scan attempt at `now_ms`. The time and error are always updated in memory;
+    /// the ledger is written (an fsync on every scan otherwise) only when the error changed
+    /// or the last write is at least [`SCAN_NOTE_INTERVAL`] old. Returns whether it wrote.
+    pub fn note_scan_at(&mut self, now_ms: u64, error: Option<String>) -> Result<bool, String> {
+        let changed = self.data.last_scan_error != error;
+        let due = self
+            .scan_persisted_ms
+            .is_none_or(|t| now_ms.saturating_sub(t) >= SCAN_NOTE_INTERVAL.as_millis() as u64);
+        if changed || due {
+            self.commit(|d| {
+                d.last_scan_unix_ms = Some(now_ms);
+                d.last_scan_error = error;
+            })?;
+            return Ok(true);
+        }
+        self.data.last_scan_unix_ms = Some(now_ms);
+        Ok(false)
     }
 }
 
@@ -271,6 +298,18 @@ pub struct MirrorScan {
     /// `(title, error)` of sources skipped because their stamp has not changed since they
     /// were found unsupported.
     pub unsupported: Vec<(String, String)>,
+    /// Listed sources whose directory or `nbk` could not be stat-ed this round (missing, or
+    /// not a directory): neither acted on nor removed.
+    pub skipped: usize,
+}
+
+/// A stat error on a listed source that skips the source instead of failing the scan:
+/// its directory or `nbk` is missing, or the listed path is not a directory at all.
+fn skip_source(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Classify every Amazon notebook against the ledger. Metadata only, never decodes.
@@ -292,8 +331,11 @@ pub fn scan(src: &ImportSources, ledger: &MirrorLedger) -> Result<MirrorScan, St
         let stamp = match try_stamp(&source.dir) {
             Ok(st) => st,
             // Listed but its directory or `nbk` is missing (or deleted between discover and
-            // stamp): present but skipped this round, no action either way.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // stamp), or the listed path is a file rather than a directory: present but
+            // skipped this round, no action either way. One bad catalog row never pauses
+            // every other mirror.
+            Err(e) if skip_source(&e) => {
+                out.skipped += 1;
                 continue;
             }
             Err(e) => return Err(format!("stat {}: {e}", source.dir.display())),
@@ -514,8 +556,10 @@ pub enum Which {
 }
 
 /// The local folder for `which`: the ledger-recorded id while the folder still exists (a user
-/// rename keeps it), otherwise a freshly created one (the user deleted it), captured for sync
-/// and recorded in the ledger.
+/// rename keeps it); otherwise an existing folder titled exactly as the mirror would title it
+/// (a Restore from Server brings the folder back but not the ledger: reuse it rather than
+/// make a second `Amazon`); otherwise a freshly created one (the user deleted it), captured
+/// for sync. Either way the id is recorded in the ledger.
 pub(crate) fn ensure_folder(
     ledger: &mut MirrorLedger,
     folders: &mut FolderStore,
@@ -532,8 +576,19 @@ pub(crate) fn ensure_folder(
             return Ok(id.clone());
         }
     }
-    let id = folders.create(title, live)?;
-    sync.folder_changed(folders, FolderCapture::Created(id.clone()));
+    let existing = folders
+        .view(live)
+        .into_iter()
+        .find(|f| f.title == title)
+        .map(|f| f.id);
+    let id = match existing {
+        Some(id) => id,
+        None => {
+            let id = folders.create(title, live)?;
+            sync.folder_changed(folders, FolderCapture::Created(id.clone()));
+            id
+        }
+    };
     let (amazon, removed) = match which {
         Which::Amazon => (Some(id.clone()), ledger.data.removed_folder.clone()),
         Which::Removed => (ledger.data.amazon_folder.clone(), Some(id.clone())),
@@ -975,9 +1030,13 @@ fn remove(
     Ok(MirrorOutcome::Done)
 }
 
-/// Startup: every `Rebuilding` entry's notebook is removed through the synced delete path and
-/// the entry dropped (so the next scan recreates it). Runs before any UI, next to the
-/// `nbk_import` recovery. Returns how many entries were recovered.
+/// Crash recovery: every `Rebuilding` entry's notebook is removed through the synced delete
+/// path and the entry dropped (so the next scan recreates it). Runs once per process at the
+/// first structural safe point where sync is linked ([`recovery_due`]), never at launch: with
+/// sync not installed `GlobalSync::delete_notebook` falls back to a local delete and the
+/// server would keep the partial. Until it runs, a scan still classifies the entry as
+/// `Rebuild`, which rebuilds the partial in place (never a second mirror). Returns how many
+/// entries were recovered.
 pub(crate) fn recover_interrupted(
     library: &mut LibraryRepository,
     sync: &dyn MirrorSync,
@@ -1026,6 +1085,20 @@ pub struct MirrorRun {
 pub struct MirrorClock {
     pub last_scan: Option<Instant>,
     pub last_batches: u64,
+    /// [`recover_interrupted`] has run (or been attempted) this process.
+    pub recovery_done: bool,
+    /// Listed sources the last completed scan skipped ([`MirrorScan::skipped`]).
+    pub last_skipped: usize,
+    /// Wall-clock time of the last scan attempt; exact even when the ledger's own copy was
+    /// not written (see [`MirrorLedger::note_scan_at`]).
+    pub last_scan_unix_ms: Option<u64>,
+}
+
+/// Should crash recovery run now? Once per process, and only once sync is linked, so the
+/// partial's delete reaches the server. Recovery precedes the first scan and step: both
+/// share this gate's safe point and run only while `sync_linked` too.
+pub fn recovery_due(clock: &MirrorClock, sync_linked: bool) -> bool {
+    !clock.recovery_done && sync_linked
 }
 
 /// Apply the Preferences toggle to the scheduler. Off drops any in-progress run (each step is
@@ -1075,6 +1148,11 @@ pub fn scan_allowed(view: AppView, import_running: bool, sync_linked: bool) -> b
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MirrorSummary {
     pub enabled: bool,
+    /// Sync is installed, so scans and rebuilds may run; `enabled && !sync_linked` shows as
+    /// `on (waiting for sync)`.
+    pub sync_linked: bool,
+    /// Listed sources the last scan skipped (directory or `nbk` missing, or not a directory).
+    pub skipped: usize,
     /// Ledger entries in step with Amazon.
     pub current: usize,
     /// `Rebuilding` entries plus actions still queued in the running pass.
@@ -1087,20 +1165,29 @@ pub struct MirrorSummary {
     pub now_unix_ms: u64,
 }
 
-/// Summarize the ledger for the Tools screen. `queued` is the running pass's queue length.
-pub fn summary(
-    ledger: &MirrorLedger,
-    enabled: bool,
-    queued: usize,
-    now_unix_ms: u64,
-) -> MirrorSummary {
+/// What the runtime knows about the mirror beyond the ledger: the toggle, whether sync is
+/// linked, the running pass's queue length and the last scan's skipped count.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MirrorLive {
+    pub enabled: bool,
+    pub sync_linked: bool,
+    pub queued: usize,
+    pub skipped: usize,
+    /// The runtime's exact last scan time; the later of it and the ledger's copy is shown.
+    pub last_scan_unix_ms: Option<u64>,
+}
+
+/// Summarize the ledger for the Tools screen.
+pub fn summary(ledger: &MirrorLedger, live: MirrorLive, now_unix_ms: u64) -> MirrorSummary {
     let d = &ledger.data;
     let count = |s: MirrorState| d.entries.values().filter(|e| e.state == s).count();
     MirrorSummary {
-        enabled,
+        enabled: live.enabled,
+        sync_linked: live.sync_linked,
+        skipped: live.skipped,
         current: count(MirrorState::Current),
-        pending: count(MirrorState::Rebuilding) + queued,
-        last_scan_unix_ms: d.last_scan_unix_ms,
+        pending: count(MirrorState::Rebuilding) + live.queued,
+        last_scan_unix_ms: live.last_scan_unix_ms.max(d.last_scan_unix_ms),
         last_scan_error: d.last_scan_error.clone(),
         unsupported: d
             .entries

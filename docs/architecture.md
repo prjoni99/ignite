@@ -87,6 +87,21 @@ browser companion.
 - Copy to Ignite: the Home card menu runs the existing one-way import to make
   an editable copy; a source is copied at most once (an `Already copied`
   notice afterwards).
+- Crash recovery runs once per process at the first safe point where sync is
+  linked, not at launch: with sync off or faulted the partial's delete would
+  be local only and the server would keep it. Until it runs, a scan sees the
+  `rebuilding` entry and rebuilds the partial in place (never a second mirror).
+- Restore from Server replaces the library with the server's copy. The
+  `Amazon` folder and the mirrored notebooks come back, but neither the ledger
+  nor the `mirror-origin.json` markers do (markers are not synced), so the
+  restored copies are ordinary, editable notebooks. The next scan recreates
+  every mirror from the Kindle's sources and files them into the existing
+  folder titled `Amazon` (an unrecorded folder with that exact title is
+  reused, never duplicated). Restored copies are deliberately *not* adopted:
+  a title plus page count also matches a user's own notebook, and a wrong
+  claim would make it read-only and overwrite its ink at the next rebuild.
+  The user may delete the unmarked restored copies; the marked ones are the
+  mirrors.
 - Setting: Preferences → `AMAZON MIRROR` (`mirror_amazon` in replica-local
   `preferences.json`, default on). Tools shows status and `RESCAN NOW`.
 

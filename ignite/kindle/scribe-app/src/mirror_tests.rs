@@ -294,6 +294,7 @@ fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
     k.remove_dir_only(ID_A);
     k.touch(ID_B);
     let got = scan(&k.sources(), &l).unwrap();
+    assert_eq!(got.skipped, 1);
     assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
     assert!(!got
         .actions
@@ -312,6 +313,39 @@ fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
 }
 
 #[test]
+fn a_listed_source_that_is_a_file_not_a_directory_is_skipped_not_fatal() {
+    // One bad catalog row (the uuid path is a plain file) must not pause every mirror.
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    k.add_synthetic(ID_B, "Two");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    l.put(entry_at(&k, ID_B, "Two", MirrorState::Current))
+        .unwrap();
+    k.remove_dir_only(ID_A);
+    fs::write(k.root.join(ID_A), b"not a directory").unwrap();
+    assert!(skip_source(&try_stamp(&k.root.join(ID_A)).unwrap_err()));
+    k.touch(ID_B);
+    let got = scan(&k.sources(), &l).unwrap();
+    assert_eq!(got.skipped, 1);
+    assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
+    assert!(!got
+        .actions
+        .iter()
+        .any(|a| matches!(a, MirrorAction::Remove { .. })));
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source, .. }] if source.origin_id == ID_B
+    ));
+    // A permission error is still fatal (it says nothing about that one row).
+    assert!(!skip_source(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
+}
+
+#[test]
 fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
     let mut run = Some(MirrorRun {
         queue: VecDeque::from([MirrorAction::Remove {
@@ -323,6 +357,9 @@ fn the_toggle_cancels_a_run_when_off_and_forces_a_scan_when_on() {
     let mut clock = MirrorClock {
         last_scan: Some(Instant::now()),
         last_batches: 3,
+        recovery_done: false,
+        last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(apply_mirror_toggle(false, &mut run, &mut clock));
     assert!(run.is_none());
@@ -479,6 +516,30 @@ fn ensure_folder_recreates_when_the_user_deleted_it() {
     assert_ne!(a, b);
     assert_eq!(f.title(&b), Some(AMAZON_FOLDER_TITLE));
     assert_eq!(l.data.amazon_folder.as_deref(), Some(b.as_str()));
+}
+
+#[test]
+fn ensure_folder_adopts_an_existing_folder_with_the_mirror_title_when_the_ledger_has_none() {
+    // Restore from Server replaces the library: the `Amazon` folder comes back, the ledger
+    // does not. The next mirror reuses that folder instead of creating a second `Amazon`.
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let mut f = crate::folders::FolderStore::open(s.lib.root());
+    let live = s.lib.manifest().notebook_ids.clone();
+    let other = f.create("Work", &live).unwrap();
+    let restored = f.create(AMAZON_FOLDER_TITLE, &live).unwrap();
+    let count = f.view(&live).len();
+    let a = ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap();
+    assert_eq!(a, restored);
+    assert_ne!(a, other);
+    assert_eq!(f.view(&live).len(), count, "no folder created");
+    assert_eq!(l.data.amazon_folder.as_deref(), Some(restored.as_str()));
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, l.data);
+    // Only an exact title matches; `Removed from Amazon` is still created when absent.
+    let r = ensure_folder(&mut l, &mut f, &live, Which::Removed, &NoSync).unwrap();
+    assert_ne!(r, restored);
+    assert_eq!(f.title(&r), Some(REMOVED_FOLDER_TITLE));
+    assert_eq!(f.view(&live).len(), count + 1);
 }
 
 fn two_page_notebook(s: &mut Scribe, id: &str) -> PathBuf {
@@ -1448,11 +1509,17 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
     let launch = MirrorClock {
         last_scan: None,
         last_batches: 0,
+        recovery_done: false,
+        last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(scan_due(&launch, t0, 0));
     let after = MirrorClock {
         last_scan: Some(t0),
         last_batches: 3,
+        recovery_done: false,
+        last_skipped: 0,
+        last_scan_unix_ms: None,
     };
     assert!(!scan_due(&after, t0, 3));
     assert!(!scan_due(&after, t0 + Duration::from_secs(60), 3));
@@ -1463,6 +1530,40 @@ fn scan_is_due_at_launch_after_an_upload_batch_and_after_fifteen_idle_minutes() 
         3
     ));
     assert!(scan_due(&after, t0 + IDLE_RESCAN, 3));
+}
+
+#[test]
+fn recovery_waits_for_sync_and_runs_once_per_process() {
+    let mut clock = MirrorClock::default();
+    // Launch with sync not installed (or faulted): a local delete would leave the partial on
+    // the server, so recovery waits.
+    assert!(!recovery_due(&clock, false));
+    assert!(recovery_due(&clock, true));
+    clock.recovery_done = true;
+    assert!(!recovery_due(&clock, true));
+    assert!(!recovery_due(&clock, false));
+    // The toggle does not reset it: recovery is independent of the preference.
+    let mut run = None;
+    apply_mirror_toggle(true, &mut run, &mut clock);
+    assert!(clock.recovery_done);
+    assert!(!recovery_due(&clock, true));
+}
+
+#[test]
+fn a_rebuilding_entry_rebuilds_in_place_before_recovery_never_a_second_mirror() {
+    // Until recovery runs, a scan sees the Rebuilding entry and schedules a Rebuild, which
+    // reuses the partial notebook: at no point do two mirrors of one origin exist.
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Rebuilding))
+        .unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source, .. }] if source.origin_id == ID_A
+    ));
 }
 
 #[test]
@@ -1544,13 +1645,24 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
     );
     let ledger = MirrorLedger {
         path: PathBuf::new(),
+        scan_persisted_ms: None,
         data,
     };
-    let s = summary(&ledger, true, 2, 181_000);
+    let live = MirrorLive {
+        enabled: true,
+        sync_linked: true,
+        queued: 2,
+        skipped: 1,
+        // Older than the ledger's copy: the later one shows.
+        last_scan_unix_ms: Some(500),
+    };
+    let s = summary(&ledger, live, 181_000);
     assert_eq!(
         s,
         MirrorSummary {
             enabled: true,
+            sync_linked: true,
+            skipped: 1,
             current: 2,
             // One Rebuilding entry plus two queued actions.
             pending: 3,
@@ -1562,13 +1674,68 @@ fn summary_counts_ledger_states_and_carries_the_last_scan() {
     );
     let empty = MirrorLedger {
         path: PathBuf::new(),
+        scan_persisted_ms: None,
         data: MirrorLedgerV1::default(),
     };
     assert_eq!(
-        summary(&empty, false, 0, 5),
+        summary(&empty, MirrorLive::default(), 5),
         MirrorSummary {
             now_unix_ms: 5,
             ..MirrorSummary::default()
         }
+    );
+    // The runtime's exact time wins when the ledger's copy was throttled.
+    let live = MirrorLive {
+        last_scan_unix_ms: Some(4),
+        ..MirrorLive::default()
+    };
+    assert_eq!(summary(&empty, live, 5).last_scan_unix_ms, Some(4));
+}
+
+#[test]
+fn note_scan_writes_only_on_an_error_change_or_every_fifteen_minutes() {
+    let s = Scribe::new();
+    let on_disk = || MirrorLedger::open(s.lib.root()).unwrap().data;
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let step = SCAN_NOTE_INTERVAL.as_millis() as u64;
+    let t0 = 1_000_000;
+    // First scan ever: written.
+    assert_eq!(l.note_scan_at(t0, None), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0));
+    // Same outcome a minute later: memory exact, disk untouched.
+    assert_eq!(l.note_scan_at(t0 + 60_000, None), Ok(false));
+    assert_eq!(l.data.last_scan_unix_ms, Some(t0 + 60_000));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0));
+    // An error appears: written at once.
+    let err = Some("Kindle catalog: locked".to_string());
+    assert_eq!(l.note_scan_at(t0 + 120_000, err.clone()), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000));
+    assert_eq!(on_disk().last_scan_error, err);
+    // The same error again: not written until the interval elapsed since the last write.
+    assert_eq!(l.note_scan_at(t0 + 180_000, err.clone()), Ok(false));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000));
+    assert_eq!(
+        l.note_scan_at(t0 + 120_000 + step - 1, err.clone()),
+        Ok(false)
+    );
+    assert_eq!(l.note_scan_at(t0 + 120_000 + step, err.clone()), Ok(true));
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 120_000 + step));
+    // The error clears: written at once.
+    assert_eq!(l.note_scan_at(t0 + 120_000 + step + 1, None), Ok(true));
+    assert_eq!(on_disk().last_scan_error, None);
+    // Any other commit carries the exact in-memory time to disk and resets the interval.
+    assert_eq!(l.note_scan_at(t0 + 200_000 + step, None), Ok(false));
+    l.put(entry(ID_A, MirrorState::Current)).unwrap();
+    assert_eq!(on_disk().last_scan_unix_ms, Some(t0 + 200_000 + step));
+    assert_eq!(
+        l.note_scan_at(t0 + 200_000 + step + step - 1, None),
+        Ok(false)
+    );
+    assert_eq!(l.note_scan_at(t0 + 200_000 + step + step, None), Ok(true));
+    // A fresh open compares against the persisted time, not the exact one.
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    assert_eq!(
+        l.note_scan_at(t0 + 200_000 + step + step + 1, None),
+        Ok(false)
     );
 }
