@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canActivateText, isAmazonMirror } from "../src/model/mirror";
+import { canActivateText, canEditPages, isAmazonMirror } from "../src/model/mirror";
 import type { SnapshotFolder, SnapshotNotebook } from "../src/model/types";
 
 const F_AMAZON = "01a0c450-6c10-7101-8203-040506070801";
@@ -50,5 +50,15 @@ describe("canActivateText", () => {
     expect(canActivateText({ ...ok, drawing: true })).toBe(false);
     expect(canActivateText({ ...ok, replicaAvailable: false })).toBe(false);
     expect(canActivateText({ ...ok, conflict: true })).toBe(false);
+  });
+});
+
+describe("canEditPages", () => {
+  const ok = { mirrorReadOnly: false, replicaAvailable: true, conflict: false };
+  it("allows a normal notebook with a ready replica", () => expect(canEditPages(ok)).toBe(true));
+  it("refuses on a mirror", () => expect(canEditPages({ ...ok, mirrorReadOnly: true })).toBe(false));
+  it("refuses without a replica or in conflict", () => {
+    expect(canEditPages({ ...ok, replicaAvailable: false })).toBe(false);
+    expect(canEditPages({ ...ok, conflict: true })).toBe(false);
   });
 });

@@ -14,3 +14,8 @@ export function isAmazonMirror(snapshot: Pick<SyncSnapshotV1, "notebooks" | "fol
 export function canActivateText(opts: { mirrorReadOnly: boolean; drawing: boolean; replicaAvailable: boolean; conflict: boolean }): boolean {
   return !opts.mirrorReadOnly && !opts.drawing && opts.replicaAvailable && !opts.conflict;
 }
+
+/** Whether Insert page / Delete page are offered and enabled. Never on a read-only mirror. */
+export function canEditPages(opts: { mirrorReadOnly: boolean; replicaAvailable: boolean; conflict: boolean }): boolean {
+  return !opts.mirrorReadOnly && opts.replicaAvailable && !opts.conflict;
+}

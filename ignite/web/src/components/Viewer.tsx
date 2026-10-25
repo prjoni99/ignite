@@ -4,7 +4,7 @@ import { libraryPrefs } from "../app/libraryPrefs";
 import type { FinishedStroke } from "../authoring/capture";
 import { DEFAULT_TEXT_SESSION_FONT_SIZE, stepTextFontSize, textFontPercent } from "../authoring/textSession";
 import { SORT_LABELS } from "../model/librarySort";
-import { canActivateText, isAmazonMirror } from "../model/mirror";
+import { canActivateText, canEditPages, isAmazonMirror } from "../model/mirror";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
 import type { BlobCache } from "../rendering/background";
@@ -155,6 +155,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   const pageId = r?.page.page_id ?? "";
   const notebookId = r?.notebook.notebook_id ?? "";
   const mirrorReadOnly = viewSnapshot ? isAmazonMirror(viewSnapshot, notebookId) : false;
+  const pagesEditable = canEditPages({ mirrorReadOnly, replicaAvailable: replica.kind === "ready", conflict: sync.conflict !== null });
   const mode = zoom && zoom.pageId === pageId ? zoom.mode : FIT;
 
   const go = useCallback(
@@ -819,24 +820,28 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
               Undo
             </RoughControlButton>
           )}
-          <RoughControlButton
-            identity="insert-page"
-            data-testid="insert-page"
-            disabled={replica.kind !== "ready" || sync.conflict !== null}
-            title="Insert a blank page after this one"
-            onClick={() => void onInsertPage()}
-          >
-            Insert page
-          </RoughControlButton>
-          <RoughControlButton
-            identity="delete-page"
-            data-testid="delete-page"
-            disabled={replica.kind !== "ready" || sync.conflict !== null || pageCount < 2}
-            title={pageCount < 2 ? "A notebook needs at least one page." : "Delete this page"}
-            onClick={() => setPageConfirm("delete")}
-          >
-            Delete page
-          </RoughControlButton>
+          {!mirrorReadOnly && (
+            <>
+              <RoughControlButton
+                identity="insert-page"
+                data-testid="insert-page"
+                disabled={!pagesEditable}
+                title="Insert a blank page after this one"
+                onClick={() => void onInsertPage()}
+              >
+                Insert page
+              </RoughControlButton>
+              <RoughControlButton
+                identity="delete-page"
+                data-testid="delete-page"
+                disabled={!pagesEditable || pageCount < 2}
+                title={pageCount < 2 ? "A notebook needs at least one page." : "Delete this page"}
+                onClick={() => setPageConfirm("delete")}
+              >
+                Delete page
+              </RoughControlButton>
+            </>
+          )}
         </div>
         <div className="zoom-group">
           <RoughControlButton
@@ -876,7 +881,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
           {toast.text}
         </div>
       )}
-      {pageConfirm === "delete" && (
+      {pageConfirm === "delete" && !mirrorReadOnly && (
         <div className="dialog-scrim" onClick={() => setPageConfirm(null)}>
           <div className="dialog" role="dialog" aria-modal="true" aria-label="Delete page" data-testid="page-dialog" onClick={(e) => e.stopPropagation()}>
             <h2 className="dialog-heading">Delete this page?</h2>
