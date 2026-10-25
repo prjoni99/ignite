@@ -33,7 +33,8 @@ pub fn now_local() -> Option<LocalDateTime> {
 
 /// Convert unix seconds to local time; `None` on failure or an untrusted year.
 pub fn local_from_unix(secs: i64) -> Option<LocalDateTime> {
-    let t = secs as libc::time_t;
+    // `time_t` is i32 on armv7 (Kindle): instants past 2038 are `None` there, never truncated.
+    let t = libc::time_t::try_from(secs).ok()?;
     // SAFETY: `tm` is a plain-old-data struct for which all-zero is valid; `t` and `tm`
     // are live locals, and `localtime_r` only writes through the `tm` pointer.
     let tm = unsafe {
@@ -116,6 +117,13 @@ mod tests {
         assert_eq!(ym(&d), "2026-10");
         assert_eq!(long_date(&d), "Sunday 25 October 2026");
         assert_eq!(stamp(&d), "Sun 25 Oct 17:40");
+    }
+
+    #[test]
+    fn out_of_range_instants_are_none() {
+        use_utc();
+        // Too large for a 32-bit time_t, and past localtime_r's year range on 64-bit.
+        assert_eq!(local_from_unix(i64::MAX), None);
     }
 
     #[test]

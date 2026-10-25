@@ -9,6 +9,7 @@ pub mod app_ui;
 mod background_identity_tests;
 pub mod cadence;
 pub mod chrome;
+#[cfg(unix)]
 pub mod clock;
 pub mod content;
 pub mod discovery;
