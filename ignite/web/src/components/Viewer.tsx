@@ -4,6 +4,7 @@ import { libraryPrefs } from "../app/libraryPrefs";
 import type { FinishedStroke } from "../authoring/capture";
 import { DEFAULT_TEXT_SESSION_FONT_SIZE, stepTextFontSize, textFontPercent } from "../authoring/textSession";
 import { SORT_LABELS } from "../model/librarySort";
+import { isAmazonMirror } from "../model/mirror";
 import { linkJumpLabel, MISSING_LINK_LABEL, preserveSelection, resolve, resolveLinkTarget, stepPage } from "../model/selection";
 import type { PageSpec, SnapshotNotebook, SyncPageLink, SyncStroke, SyncText, SyncSnapshotV1 } from "../model/types";
 import type { BlobCache } from "../rendering/background";
@@ -153,6 +154,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
   const r = viewSnapshot ? resolve(viewSnapshot, viewSel) : null;
   const pageId = r?.page.page_id ?? "";
   const notebookId = r?.notebook.notebook_id ?? "";
+  const mirrorReadOnly = viewSnapshot ? isAmazonMirror(viewSnapshot, notebookId) : false;
   const mode = zoom && zoom.pageId === pageId ? zoom.mode : FIT;
 
   const go = useCallback(
@@ -394,6 +396,12 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
     return true;
   }, [finalizeTextForTransition, uiMode]);
 
+  // A switch into the read-only Amazon mirror leaves ink/type through the same gated transition as Done.
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async gated transition, driven by the selection changing
+    if (mirrorReadOnly && uiMode !== "read") void leaveAuthoring("read");
+  }, [mirrorReadOnly, uiMode, leaveAuthoring]);
+
   const onErase = useCallback(
     async (g: EraseGesture): Promise<boolean> => {
       if (replica.kind !== "ready" || !pageId || !notebookId) return false;
@@ -599,7 +607,7 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
               Done
             </RoughControlButton>
           </span>
-        ) : (
+        ) : mirrorReadOnly ? null : (
           <>
             <RoughControlButton
               identity="write"
@@ -725,6 +733,11 @@ export function Viewer({ session, blobs, onDisconnect, onChooseLibrary, replica 
         {drawerOpen && <div className="scrim" onClick={() => setDrawerOpen(false)} />}
 
         <main className="page-pane">
+          {mirrorReadOnly && (
+            <div className="mirror-banner" role="status" data-testid="mirror-banner">
+              Mirrored from Amazon. Read-only here; write in Ignite or copy it on the Kindle.
+            </div>
+          )}
           <PageView
             page={page}
             notebookId={notebookId}
