@@ -62,20 +62,24 @@ browser companion.
   is created or removed.
 - Cadence: a stat-only scan runs at launch, after each completed sync upload
   batch and every 15 minutes. A rebuild (decode + ordinary sync operations)
-  runs one notebook per loop iteration. Both run only at the safe point: Home
-  or Tools showing, pen idle, no page open. Never while sync is off or unlinked.
+  runs one notebook per loop iteration. A scan runs only while Home or Tools is
+  showing and the pen is idle; a rebuild only while Home or Tools is showing,
+  never with a page open. Never while sync is off or unlinked.
 - Rebuild order: new pages and strokes first, old pages deleted after, so a
   notebook never drops below one page. Strokes flush to the journal in batches
   (same backpressure as "Import Kindle notebooks"). A crash mid-rebuild is
   cleaned up at next launch (partial mirror removed via the synced delete path,
   recreated by the next scan); never more than one mirror per source.
 - Read-only: on the Kindle, pen/eraser, undo, page add/move/delete, link
-  add/remove, lasso moves and rename are refused with a hint pointing to Copy
-  to Ignite. In the browser companion, a notebook in a folder titled exactly
-  `Amazon` shows a read-only banner and offers no Write/Type tools; moving it
-  out lifts the convention (the next rebuild files it back).
+  add/remove, lasso moves and rename are refused with `This notebook mirrors
+  Amazon and is read-only. Use Copy to Ignite from Home.` In the browser
+  companion, a notebook in a folder titled exactly `Amazon` shows `Mirrored
+  from Amazon. Read-only here; write in Ignite or copy it on the Kindle.` and
+  offers no Write/Type tools; moving it out lifts the convention (the next
+  rebuild files it back).
 - Copy to Ignite: the Home card menu runs the existing one-way import to make
-  an editable copy; a source is copied at most once.
+  an editable copy; a source is copied at most once (`Already copied to
+  Ignite.` afterwards).
 - Setting: Preferences → `AMAZON MIRROR` (`mirror_amazon` in replica-local
   `preferences.json`, default on). Tools shows status and `RESCAN NOW`.
 
