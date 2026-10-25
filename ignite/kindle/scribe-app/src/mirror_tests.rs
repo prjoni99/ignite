@@ -294,6 +294,7 @@ fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
     k.remove_dir_only(ID_A);
     k.touch(ID_B);
     let got = scan(&k.sources(), &l).unwrap();
+    assert_eq!(got.skipped, 1);
     assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
     assert!(!got
         .actions
@@ -309,6 +310,39 @@ fn a_listed_source_whose_directory_is_missing_is_skipped_not_removed() {
     fs::create_dir_all(k.root.join(ID_A)).unwrap();
     let got = scan(&k.sources(), &l).unwrap();
     assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
+}
+
+#[test]
+fn a_listed_source_that_is_a_file_not_a_directory_is_skipped_not_fatal() {
+    // One bad catalog row (the uuid path is a plain file) must not pause every mirror.
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    k.add_synthetic(ID_B, "Two");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    l.put(entry_at(&k, ID_B, "Two", MirrorState::Current))
+        .unwrap();
+    k.remove_dir_only(ID_A);
+    fs::write(k.root.join(ID_A), b"not a directory").unwrap();
+    assert!(skip_source(&try_stamp(&k.root.join(ID_A)).unwrap_err()));
+    k.touch(ID_B);
+    let got = scan(&k.sources(), &l).unwrap();
+    assert_eq!(got.skipped, 1);
+    assert!(got.actions.iter().all(|a| a.origin_id() != ID_A));
+    assert!(!got
+        .actions
+        .iter()
+        .any(|a| matches!(a, MirrorAction::Remove { .. })));
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source, .. }] if source.origin_id == ID_B
+    ));
+    // A permission error is still fatal (it says nothing about that one row).
+    assert!(!skip_source(&std::io::Error::from(
+        std::io::ErrorKind::PermissionDenied
+    )));
 }
 
 #[test]

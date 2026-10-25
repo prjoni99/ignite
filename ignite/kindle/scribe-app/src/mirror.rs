@@ -271,6 +271,18 @@ pub struct MirrorScan {
     /// `(title, error)` of sources skipped because their stamp has not changed since they
     /// were found unsupported.
     pub unsupported: Vec<(String, String)>,
+    /// Listed sources whose directory or `nbk` could not be stat-ed this round (missing, or
+    /// not a directory): neither acted on nor removed.
+    pub skipped: usize,
+}
+
+/// A stat error on a listed source that skips the source instead of failing the scan:
+/// its directory or `nbk` is missing, or the listed path is not a directory at all.
+fn skip_source(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Classify every Amazon notebook against the ledger. Metadata only, never decodes.
@@ -292,8 +304,11 @@ pub fn scan(src: &ImportSources, ledger: &MirrorLedger) -> Result<MirrorScan, St
         let stamp = match try_stamp(&source.dir) {
             Ok(st) => st,
             // Listed but its directory or `nbk` is missing (or deleted between discover and
-            // stamp): present but skipped this round, no action either way.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // stamp), or the listed path is a file rather than a directory: present but
+            // skipped this round, no action either way. One bad catalog row never pauses
+            // every other mirror.
+            Err(e) if skip_source(&e) => {
+                out.skipped += 1;
                 continue;
             }
             Err(e) => return Err(format!("stat {}: {e}", source.dir.display())),
