@@ -13,6 +13,9 @@ pub const SAFE_BOTTOM: u32 = 57;
 pub const LINE: u8 = 0xC0;
 pub const DOT: u8 = 0xA0;
 pub const WHITE: u8 = 0xFF;
+/// Bump whenever drawing code changes in a way that alters rendered bytes, so caches keyed on
+/// the spec re-render.
+pub const RENDERER_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

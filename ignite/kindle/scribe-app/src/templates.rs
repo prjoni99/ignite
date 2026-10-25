@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kindle_platform::FbGeometry;
-use page_templates::{sha256_hex, BUILTINS, SAFE_BOTTOM, SAFE_TOP, WHITE};
+use page_templates::{sha256_hex, BUILTINS, RENDERER_VERSION, SAFE_BOTTOM, SAFE_TOP, WHITE};
 use serde::{Deserialize, Serialize};
 
 use crate::nbk_import::write_atomic;
@@ -35,7 +35,8 @@ const INDEX_VERSION: u32 = 1;
 const THUMB_FACTOR: u32 = 8;
 /// Refuse absurd PNGs before allocating for them.
 const MAX_PNG_DIM: u32 = 16_384;
-const MAX_PNG_PIXELS: u64 = 40_000_000;
+const MAX_PNG_PIXELS: u64 = 16_000_000;
+const MAX_PNG_DECODE_BYTES: usize = 64 * 1024 * 1024;
 const PNG_IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +77,9 @@ struct IndexEntry {
     src_len: u64,
     #[serde(default)]
     src_mtime_ms: u64,
+    /// Built-ins only: sha256 of the serialized spec + `RENDERER_VERSION`.
+    #[serde(default)]
+    spec_stamp: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,8 +120,35 @@ pub fn list(data_dir: &Path) -> Vec<TemplateEntry> {
             status: TemplateStatus::Ready,
         })
         .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, path) in custom_files(data_dir) {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !valid_custom_name(stem) {
+            continue;
+        }
+        let status = if !seen.insert(stem.to_owned()) {
+            TemplateStatus::Unreadable("duplicate name".into())
+        } else {
+            match probe_png(&path) {
+                Ok(()) => TemplateStatus::Ready,
+                Err(e) => TemplateStatus::Unreadable(e),
+            }
+        };
+        out.push(TemplateEntry {
+            id: TemplateId::Custom { name: stem.into() },
+            name: stem.into(),
+            status,
+        });
+    }
+    out
+}
+
+/// `templates/custom/*.png` (extension in any case), sorted by file name case-insensitively.
+fn custom_files(data_dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = fs::read_dir(custom_dir(data_dir)) else {
-        return out;
+        return Vec::new();
     };
     let mut files: Vec<(String, PathBuf)> = rd
         .filter_map(Result::ok)
@@ -132,24 +163,7 @@ pub fn list(data_dir: &Path) -> Vec<TemplateEntry> {
         })
         .collect();
     files.sort_by_key(|(n, _)| (n.to_lowercase(), n.clone()));
-    for (_, path) in files {
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !valid_custom_name(stem) {
-            continue;
-        }
-        let status = match probe_png(&path) {
-            Ok(()) => TemplateStatus::Ready,
-            Err(e) => TemplateStatus::Unreadable(e),
-        };
-        out.push(TemplateEntry {
-            id: TemplateId::Custom { name: stem.into() },
-            name: stem.into(),
-            status,
-        });
-    }
-    out
+    files
 }
 
 /// Cheap readability check: the PNG header parses and the file ends with an IEND chunk.
@@ -188,14 +202,11 @@ fn custom_path(data_dir: &Path, name: &str) -> Result<PathBuf, String> {
     if !valid_custom_name(name) {
         return Err(refuse(format!("invalid template name {name:?}")));
     }
-    let dir = custom_dir(data_dir);
-    for ext in ["png", "PNG"] {
-        let p = dir.join(format!("{name}.{ext}"));
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-    Err(refuse(format!("custom template {name:?} not found")))
+    custom_files(data_dir)
+        .into_iter()
+        .find(|(_, p)| p.file_stem().and_then(|s| s.to_str()) == Some(name))
+        .map(|(_, p)| p)
+        .ok_or_else(|| refuse(format!("custom template {name:?} not found")))
 }
 
 /// Full-panel gray8 bitmap (`geo.xres * geo.yres`, tightly packed) for `id`, cached by the sha256
@@ -232,12 +243,12 @@ fn resolve(
     let mut index = load_index(&cache);
 
     // Validate the id and capture the source stamp (custom only) before consulting the cache.
-    let (src_path, src_len, src_mtime_ms) = match id {
+    let (src_path, src_len, src_mtime_ms, spec_stamp) = match id {
         TemplateId::Builtin { id } => {
             if !BUILTINS.iter().any(|b| b.id == id) {
                 return Err(refuse(format!("unknown built-in template {id:?}")));
             }
-            (None, 0, 0)
+            (None, 0, 0, builtin_stamp(id))
         }
         TemplateId::Custom { name } => {
             let p = custom_path(data_dir, name)?;
@@ -247,12 +258,16 @@ fn resolve(
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_millis() as u64);
-            (Some(p), md.len(), ms)
+            (Some(p), md.len(), ms, String::new())
         }
     };
 
     if let Some(e) = index.entries.get(&key) {
-        if e.src_len == src_len && e.src_mtime_ms == src_mtime_ms && sha_is_plausible(&e.sha256) {
+        if e.src_len == src_len
+            && e.src_mtime_ms == src_mtime_ms
+            && e.spec_stamp == spec_stamp
+            && sha_is_plausible(&e.sha256)
+        {
             if let Ok(bytes) = fs::read(cache.join(format!("{}.gray8", e.sha256))) {
                 if bytes.len() == want {
                     return Ok((bytes, e.sha256.clone()));
@@ -287,6 +302,7 @@ fn resolve(
             sha256: sha.clone(),
             src_len,
             src_mtime_ms,
+            spec_stamp,
         },
     );
     match serde_json::to_vec_pretty(&index) {
@@ -294,6 +310,13 @@ fn resolve(
         Err(e) => return Err(e.to_string()),
     }
     Ok((bytes, sha))
+}
+
+fn builtin_stamp(id: &str) -> String {
+    let spec = BUILTINS.iter().find(|b| b.id == id).map(|b| &b.spec);
+    let mut bytes = serde_json::to_vec(&spec).unwrap_or_default();
+    bytes.extend(RENDERER_VERSION.to_le_bytes());
+    sha256_hex(&bytes)
 }
 
 fn sha_is_plausible(s: &str) -> bool {
@@ -323,6 +346,9 @@ fn load_index(cache: &Path) -> IndexFile {
 /// ratio, centred, white everywhere else. Never panics on malformed input.
 pub fn decode_custom_png(bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     let mut dec = png::Decoder::new(Cursor::new(bytes));
+    dec.set_limits(png::Limits {
+        bytes: MAX_PNG_DECODE_BYTES,
+    });
     dec.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = dec
         .read_info()

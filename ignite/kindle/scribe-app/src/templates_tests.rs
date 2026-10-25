@@ -230,21 +230,51 @@ fn custom_png_variants_decode_or_are_reported() {
     // Adam7 interlaced grayscale (hand-built; the encoder cannot interlace).
     let adam = adam7_gray_png(16, 16, |x, y| ((x * 16 + y * 3) % 200) as u8);
     let rgba = rgba_png(10, 10, [10, 20, 30, 255]);
-    for (name, bytes) in [
-        ("rgba", &rgba),
-        ("g16", &g16),
-        ("idx", &idx),
-        ("adam", &adam),
-    ] {
+    let mid = |bm: &[u8]| {
+        bm[((SAFE_TOP + (PANEL_H - SAFE_TOP - SAFE_BOTTOM) / 2) * PANEL_W + PANEL_W / 2) as usize]
+    };
+    // Indexed with a transparent entry (tRNS): index 1 is fully transparent.
+    let trns = encode(
+        4,
+        4,
+        png::ColorType::Indexed,
+        png::BitDepth::Eight,
+        &[1u8; 16],
+        |e| {
+            e.set_palette(vec![0, 0, 0, 0, 0, 0]);
+            e.set_trns(vec![255, 0]);
+        },
+    );
+    // Adam7 with a black centre block on white.
+    let adam_block = adam7_gray_png(16, 16, |x, y| {
+        if (4..12).contains(&x) && (4..12).contains(&y) {
+            0
+        } else {
+            255
+        }
+    });
+    let expect: [(&str, &Vec<u8>, u8); 6] = [
+        ("rgba", &rgba, 0x12), // (77*10+150*20+29*30)>>8
+        ("g16", &g16, 0x40),
+        ("idx", &idx, 0x00),
+        ("adam", &adam, 152), // (8*16+8*3)%200 at the source centre
+        ("trns", &trns, 0xFF),
+        ("block", &adam_block, 0x00),
+    ];
+    for (name, bytes, centre) in expect {
         put_custom(&dir, &format!("{name}.png"), bytes);
         let bm = bitmap(&dir, &custom(name), &g).unwrap_or_else(|e| panic!("{name}: {e}"));
         safe_rows_white(&bm);
-        assert!(bm.iter().any(|&v| v != WHITE), "{name} has ink");
+        assert_eq!(mid(&bm), centre, "{name} centre pixel");
         assert_eq!(
             thumbnail(&dir, &custom(name), &g).unwrap().len(),
             (PANEL_W / 8 * (PANEL_H / 8)) as usize
         );
     }
+    let adam_bm = bitmap(&dir, &custom("adam"), &g).unwrap();
+    assert!(adam_bm.iter().any(|&v| v < 0xF0), "adam has ink");
+    let trns_bm = bitmap(&dir, &custom("trns"), &g).unwrap();
+    assert!(trns_bm.iter().all(|&v| v == WHITE), "transparent -> white");
     // Truncated: Unreadable in list, Err from bitmap, nothing cached for it.
     let cache = dir.join(TEMPLATES_DIR).join(CACHE_DIR);
     let before = fs::read_dir(&cache).unwrap().count();
@@ -265,11 +295,76 @@ fn custom_png_variants_decode_or_are_reported() {
 fn custom_png_replaced_on_disk_is_redecoded() {
     let dir = tmp("tpl-replace");
     let g = panel_geo();
-    put_custom(&dir, "x.png", &rgba_png(10, 10, [0, 0, 0, 255]));
+    let path = dir.join(TEMPLATES_DIR).join(CUSTOM_DIR).join("x.png");
+    // Same dimensions and colour type => identical encoded length; only mtime can differ.
+    put_custom(&dir, "x.png", &adam7_gray_png(8, 8, |_, _| 0));
     let a = bitmap(&dir, &custom("x"), &g).unwrap();
-    put_custom(&dir, "x.png", &rgba_png(10, 30, [0, 0, 0, 255]));
+    let old_len = fs::metadata(&path).unwrap().len();
+    put_custom(&dir, "x.png", &adam7_gray_png(8, 8, |_, _| 200));
+    assert_eq!(fs::metadata(&path).unwrap().len(), old_len, "same length");
+    let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    drop(f);
     let b = bitmap(&dir, &custom("x"), &g).unwrap();
     assert_ne!(a, b);
+}
+
+#[test]
+fn a_changed_builtin_spec_or_renderer_version_re_renders() {
+    let dir = tmp("tpl-stamp");
+    let g = panel_geo();
+    let id = TemplateId::Builtin { id: "graph".into() };
+    let a = bitmap(&dir, &id, &g).unwrap();
+    let cache = dir.join(TEMPLATES_DIR).join(CACHE_DIR);
+    let ipath = cache.join("index.json");
+    let mut idx: serde_json::Value = serde_json::from_slice(&fs::read(&ipath).unwrap()).unwrap();
+    let key = serde_json::to_string(&id).unwrap();
+    let real_sha = idx["entries"][&key]["sha256"].as_str().unwrap().to_owned();
+    assert!(!idx["entries"][&key]["spec_stamp"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    // Point at a bogus cached file with a wrong stamp: it must not be served.
+    let bogus = "0".repeat(64);
+    idx["entries"][&key]["sha256"] = bogus.clone().into();
+    idx["entries"][&key]["spec_stamp"] = "stale".into();
+    fs::write(cache.join(format!("{bogus}.gray8")), vec![0u8; a.len()]).unwrap();
+    fs::write(&ipath, serde_json::to_vec(&idx).unwrap()).unwrap();
+    let b = bitmap(&dir, &id, &g).unwrap();
+    assert_eq!(a, b, "re-rendered, not the stale file");
+    let idx: serde_json::Value = serde_json::from_slice(&fs::read(&ipath).unwrap()).unwrap();
+    assert_eq!(idx["entries"][&key]["sha256"].as_str().unwrap(), real_sha);
+    assert_ne!(
+        idx["entries"][&key]["spec_stamp"].as_str().unwrap(),
+        "stale"
+    );
+}
+
+#[test]
+fn extension_case_is_accepted_and_duplicates_are_marked() {
+    let dir = tmp("tpl-ext");
+    let g = panel_geo();
+    put_custom(&dir, "Up.PNG", &rgba_png(4, 4, [0, 0, 0, 255]));
+    assert!(bitmap(&dir, &custom("Up"), &g).is_ok());
+    put_custom(&dir, "dup.png", &rgba_png(4, 4, [0, 0, 0, 255]));
+    put_custom(&dir, "dup.PNG", &rgba_png(4, 4, [0, 0, 0, 255]));
+    // Case-insensitive filesystems (macOS default) cannot hold both files.
+    if fs::read_dir(dir.join(TEMPLATES_DIR).join(CUSTOM_DIR))
+        .unwrap()
+        .count()
+        < 3
+    {
+        return;
+    }
+    let l = list(&dir);
+    let dups: Vec<_> = l.iter().filter(|e| e.name == "dup").collect();
+    assert_eq!(dups.len(), 2);
+    assert_eq!(dups[0].status, TemplateStatus::Ready);
+    assert_eq!(
+        dups[1].status,
+        TemplateStatus::Unreadable("duplicate name".into())
+    );
 }
 
 #[test]
