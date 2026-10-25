@@ -9,19 +9,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use kindle_platform::FbGeometry;
 use serde::Deserialize;
 
 use super::*;
-use crate::ink::InkRequest;
-use crate::library::{delete_notebook_durable, open_or_create_library, DeleteNotebookHooks};
+use crate::library::{delete_notebook_durable, DeleteNotebookHooks};
+use crate::nbk_test_kit::*;
 use crate::store::load_page_read_only;
 use crate::sync_outbound::OutboundSync;
-use crate::ui_gfx::paper_background;
 
 /// Logical fixture roles for private notebook samples (ids resolved from an external manifest).
 fn journal() -> &'static str {
@@ -221,188 +217,11 @@ impl NbkImportFixtures {
     }
 }
 
-static N: AtomicU64 = AtomicU64::new(0);
-static NO_CANCEL: AtomicBool = AtomicBool::new(false);
-
-fn tmp(label: &str) -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!(
-        "scribe-nbk-import-{label}-{n}-{}",
-        N.fetch_add(1, Ordering::SeqCst)
-    ));
-    let _ = fs::remove_dir_all(&p);
-    fs::create_dir_all(&p).unwrap();
-    p
-}
-
-fn geo() -> FbGeometry {
-    FbGeometry {
-        xres: 200,
-        yres: 160,
-        xres_virtual: 208,
-        yres_virtual: 160,
-        xoffset: 0,
-        yoffset: 0,
-        bits_per_pixel: 8,
-        line_length: 208,
-        smem_len: 208 * 160,
-    }
-}
-
-fn samples_root() -> PathBuf {
-    // Private notebook samples must live outside the public Ignite tree.
-    // Example: IGNITE_NBK_IMPORT_SAMPLES=C:\path\to\samples
-    let raw = std::env::var("IGNITE_NBK_IMPORT_SAMPLES").unwrap_or_default();
-    let raw = raw.trim();
-    assert!(
-        !raw.is_empty(),
-        "IGNITE_NBK_IMPORT_SAMPLES must be set to an absolute samples/ directory \
-         (feature nbk-import-samples). Refusing to search the Ignite tree."
-    );
-    let root = PathBuf::from(raw);
-    assert!(
-        root.is_absolute(),
-        "IGNITE_NBK_IMPORT_SAMPLES must be absolute, got {}",
-        root.display()
-    );
-    root
-}
-
-fn sample(uuid: &str) -> PathBuf {
-    samples_root().join(uuid)
-}
-
-/// Fake Kindle: `.notebooks/<id>/` copies + catalog.
-struct Kindle {
-    root: PathBuf,
-    catalog: PathBuf,
-}
-
-impl Kindle {
-    fn new() -> Self {
-        let base = tmp("kindle");
-        let k = Kindle {
-            root: base.join(".notebooks"),
-            catalog: base.join("ksdk.content.db"),
-        };
-        fs::create_dir_all(&k.root).unwrap();
-        let c = rusqlite::Connection::open(&k.catalog).unwrap();
-        c.execute_batch(
-            "CREATE TABLE Nodes
-            (
-                uuid TEXT NOT NULL PRIMARY KEY,
-                title_collation    TEXT,
-                author_collation   TEXT,
-                node_type          TEXT,
-                download_state     INTEGER DEFAULT 0,
-                search_metadata    TEXT,
-                last_access_time   INTEGER DEFAULT 0,
-                last_modified_time INTEGER DEFAULT 0,
-                creation_time      INTEGER DEFAULT 0,
-                additional_data    TEXT
-            );",
-        )
-        .unwrap();
-        k
-    }
-
-    fn sources(&self) -> ImportSources {
-        ImportSources {
-            notebooks_root: self.root.clone(),
-            catalog: Some(self.catalog.clone()),
-        }
-    }
-
-    /// Put `from`'s notebook files under id `id` with catalog title `title`.
-    fn add(&self, id: &str, from: &str, title: &str) {
-        self.set_content(id, from);
-        let c = rusqlite::Connection::open(&self.catalog).unwrap();
-        c.execute(
-            "INSERT OR REPLACE INTO Nodes (uuid, title_collation, node_type, additional_data)
-             VALUES (?1, ?2, 'STANDALONE_NOTEBOOK', ?3)",
-            rusqlite::params![
-                id,
-                title,
-                format!(r#"{{"title":"{title}","notebook_template":"plain","delete_state":0}}"#)
-            ],
-        )
-        .unwrap();
-    }
-
-    /// Replace a source's content (the Amazon notebook was edited on the Kindle).
-    fn set_content(&self, id: &str, from: &str) {
-        let dir = self.root.join(id);
-        fs::create_dir_all(&dir).unwrap();
-        for f in ["nbk", "actions.log", "nbk-journal"] {
-            let src = sample(from).join(f);
-            if src.exists() {
-                fs::copy(src, dir.join(f)).unwrap();
-            }
-        }
-    }
-
-    fn rename(&self, id: &str, title: &str) {
-        let c = rusqlite::Connection::open(&self.catalog).unwrap();
-        c.execute(
-            "UPDATE Nodes SET title_collation = ?2 WHERE uuid = ?1",
-            rusqlite::params![id, title],
-        )
-        .unwrap();
-    }
-
-    /// Every file's bytes (Amazon state must never change because of Scribe).
-    fn fingerprint(&self) -> BTreeMap<String, Vec<u8>> {
-        let mut out = BTreeMap::new();
-        out.insert("catalog".into(), fs::read(&self.catalog).unwrap());
-        for d in fs::read_dir(&self.root).unwrap() {
-            let d = d.unwrap();
-            for f in fs::read_dir(d.path()).unwrap() {
-                let f = f.unwrap();
-                out.insert(
-                    format!(
-                        "{}/{}",
-                        d.file_name().to_string_lossy(),
-                        f.file_name().to_string_lossy()
-                    ),
-                    fs::read(f.path()).unwrap(),
-                );
-            }
-        }
-        out
-    }
-}
-
 const ID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
 const ID_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
 const ID_C: &str = "cccccccc-0000-0000-0000-000000000003";
 
-struct Scribe {
-    lib: LibraryRepository,
-    profile: RenderProfile,
-    paper: Vec<u8>,
-}
-
 impl Scribe {
-    fn new() -> Self {
-        let g = geo();
-        let paper = paper_background(&g);
-        let lib = open_or_create_library(&tmp("library"), InkRequest::Default, &g, &paper)
-            .unwrap()
-            .repository;
-        Self {
-            lib,
-            profile: RenderProfile::sealed_v2_pressure(0x00).unwrap(),
-            paper,
-        }
-    }
-
-    fn reopen(&mut self) {
-        self.lib = crate::library::open_library_read_only(self.lib.root()).unwrap();
-    }
-
     fn import_all(&mut self, k: &Kindle, sync: &dyn ImportSync) -> Vec<(String, ImportOutcome)> {
         let g = geo();
         let mut ledger = Ledger::open(self.lib.root()).unwrap();

@@ -69,7 +69,7 @@ pub const FALLBACK_TITLE: &str = "Kindle notebook";
 const CANVAS: (i128, i128) = (15624, 20832);
 /// Raw `nmdl.pressure` range, identical to the Scribe digitizer's ABS_PRESSURE range.
 const RAW_PRESSURE_MAX: f32 = 4095.0;
-const STROKES_PER_FSYNC: usize = 256;
+pub(crate) const STROKES_PER_FSYNC: usize = 256;
 
 /// Test-only fault points (crash = stop without any cleanup, as if the process died).
 #[cfg(test)]
@@ -263,7 +263,7 @@ pub struct Ledger {
     pub data: ReceiptsV1,
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = path.parent().ok_or("no parent")?;
     fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let tmp = path.with_extension("tmp");
@@ -525,7 +525,7 @@ pub enum ImportOutcome {
 }
 
 /// Native strokes per page (canvas checked; empty strokes dropped).
-fn convert(nb: &DecodedNotebook) -> Result<(Vec<Vec<Stroke>>, usize), String> {
+pub(crate) fn convert(nb: &DecodedNotebook) -> Result<(Vec<Vec<Stroke>>, usize), String> {
     let mut pages = Vec::with_capacity(nb.pages.len());
     let mut skipped = 0;
     for p in &nb.pages {
@@ -716,7 +716,24 @@ fn import_one_admitted(
     }
 
     // 3. Empty notebook → empty pages → strokes.
-    match build(t, &dest, src, &pages, sync) {
+    let origin = ImportOriginV1 {
+        v: 1,
+        origin_kind: ORIGIN_KIND.into(),
+        origin_id: src.origin_id.clone(),
+        imported_unix_ms: now_ms(),
+    };
+    let origin_bytes = match serde_json::to_vec_pretty(&origin) {
+        Ok(b) => b,
+        Err(e) => return fail(ledger, &mut receipt, e.to_string()),
+    };
+    match build(
+        t,
+        &dest,
+        &src.title,
+        &pages,
+        (ORIGIN_MARKER, &origin_bytes),
+        sync,
+    ) {
         Ok(()) => {
             receipt.state = ReceiptState::Complete;
             receipt.finished_unix_ms = Some(now_ms());
@@ -757,30 +774,22 @@ fn import_one_admitted(
     }
 }
 
-fn build(
+pub(crate) fn build(
     t: &mut ImportTarget<'_>,
     dest: &str,
-    src: &SourceNotebook,
+    title: &str,
     pages: &[Vec<Stroke>],
+    marker: (&str, &[u8]),
     sync: &dyn ImportSync,
 ) -> Result<(), String> {
     let index = t.library.manifest().notebook_ids.len();
     let dims = (t.geo.xres, t.geo.yres, t.geo.line_length);
     create_notebook_at_durable(
-        t.library, dest, &src.title, index, "page-1", dims, t.paper, t.profile,
+        t.library, dest, title, index, "page-1", dims, t.paper, t.profile,
     )?;
     let nb_dir = t.library.notebook_dir(dest);
-    let origin = ImportOriginV1 {
-        v: 1,
-        origin_kind: ORIGIN_KIND.into(),
-        origin_id: src.origin_id.clone(),
-        imported_unix_ms: now_ms(),
-    };
-    write_atomic(
-        &nb_dir.join(ORIGIN_MARKER),
-        &serde_json::to_vec_pretty(&origin).map_err(|e| e.to_string())?,
-    )?;
-    sync.notebook_created(t.library, dest, &src.title);
+    write_atomic(&nb_dir.join(marker.0), marker.1)?;
+    sync.notebook_created(t.library, dest, title);
     sync.flush(t.cancel)
         .map_err(|e| halt(e, "notebook create"))?;
 

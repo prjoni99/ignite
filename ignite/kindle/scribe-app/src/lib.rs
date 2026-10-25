@@ -49,6 +49,8 @@ pub mod modal;
 pub mod nav;
 pub mod nav_state;
 pub mod nbk_import;
+#[cfg(test)]
+pub(crate) mod nbk_test_kit;
 pub mod notebook;
 pub mod open_page;
 pub mod orch;
