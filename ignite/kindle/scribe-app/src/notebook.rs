@@ -1012,15 +1012,58 @@ pub fn insert_page_after_durable(
     after_page_id: &str,
     hooks: &InsertPageHooks,
 ) -> Result<InsertPageCommit, String> {
+    // Template from the current page so profile/background match the notebook.
+    insert_page_after_with(data_dir, manifest, after_page_id, hooks, |new_id| {
+        create_page_files_from_template(data_dir, new_id, after_page_id).map(|_| ())
+    })
+}
+
+/// Insert after `after_page_id` like [`insert_page_after_durable`], but the new page's
+/// `background.raw` is exactly `background` (a page template bitmap). Panel dimensions and the
+/// render profile come from the `after_page_id` page.
+pub fn insert_page_after_with_background(
+    data_dir: &Path,
+    manifest: &mut PersistedNotebookManifestV1,
+    after_page_id: &str,
+    background: &[u8],
+    hooks: &InsertPageHooks,
+) -> Result<InsertPageCommit, String> {
+    insert_page_after_with(data_dir, manifest, after_page_id, hooks, |new_id| {
+        if page_exists(data_dir, new_id) {
+            return Err(format!(
+                "REFUSE PAGE CREATE: {new_id} already exists on disk"
+            ));
+        }
+        let (_tmpl_store, tmpl) = load_existing_page(data_dir, after_page_id)?;
+        create_new_page(
+            data_dir,
+            new_id,
+            tmpl.header.panel_width,
+            tmpl.header.panel_height,
+            tmpl.header.line_length,
+            background,
+            &tmpl.render_profile,
+        )
+        .map(|_| ())
+    })
+}
+
+/// Shared insert sequence: plan, create the page files with `create`, then commit the manifest
+/// (removing the new page directory if the commit fails).
+fn insert_page_after_with(
+    data_dir: &Path,
+    manifest: &mut PersistedNotebookManifestV1,
+    after_page_id: &str,
+    hooks: &InsertPageHooks,
+    create: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<InsertPageCommit, String> {
     let (planned, new_id, insert_at) = plan_insert_after(manifest, after_page_id)?;
     if !page_exists(data_dir, after_page_id) {
         return Err(format!(
             "REFUSE PAGE INSERT: after page directory {after_page_id} missing"
         ));
     }
-    // Template from the current page so profile/background match the notebook.
-    create_page_files_from_template(data_dir, &new_id, after_page_id)
-        .map_err(|e| format!("REFUSE PAGE INSERT: create page files failed: {e}"))?;
+    create(&new_id).map_err(|e| format!("REFUSE PAGE INSERT: create page files failed: {e}"))?;
 
     let t0 = Instant::now();
     if let Err(e) = write_manifest_atomic_with(data_dir, &planned, &hooks.manifest) {
@@ -1102,6 +1145,61 @@ mod tests {
             brush: None,
             finished: true,
         }
+    }
+
+    #[test]
+    fn insert_page_after_with_background_uses_the_given_bitmap() {
+        let root = tmp();
+        let g = geo();
+        let mut open = open_or_create_notebook(&root, InkRequest::Default, &g, &bg()).unwrap();
+        let plain = insert_page_after_durable(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &InsertPageHooks::default(),
+        )
+        .unwrap();
+        let bitmap: Vec<u8> = (0..800u32).map(|i| (i % 251) as u8).collect();
+        let commit = insert_page_after_with_background(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &bitmap,
+            &InsertPageHooks::default(),
+        )
+        .unwrap();
+        assert_eq!(commit.insert_index, 1);
+        assert_eq!(
+            open.manifest.page_ids,
+            vec![
+                "page-1".to_string(),
+                commit.inserted_page_id.clone(),
+                plain.inserted_page_id.clone()
+            ]
+        );
+        let raw = fs::read(root.join(&commit.inserted_page_id).join("background.raw")).unwrap();
+        assert_eq!(raw, bitmap);
+        let (_, loaded) = load_existing_page(&root, &commit.inserted_page_id).unwrap();
+        assert_eq!(loaded.background, bitmap);
+        assert_eq!(loaded.header.panel_width, 40);
+        assert_eq!(loaded.header.panel_height, 20);
+        // The manifest on disk is the committed order.
+        let on_disk: PersistedNotebookManifestV1 =
+            serde_json::from_str(&fs::read_to_string(manifest_path(&root)).unwrap()).unwrap();
+        assert_eq!(on_disk.page_ids, open.manifest.page_ids);
+        // A wrong-sized bitmap is refused and leaves nothing behind.
+        let before = open.manifest.clone();
+        let err = insert_page_after_with_background(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &[0u8; 7],
+            &InsertPageHooks::default(),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("REFUSE PAGE INSERT"), "{err}");
+        assert_eq!(open.manifest, before);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
