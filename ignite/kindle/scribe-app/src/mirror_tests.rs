@@ -118,7 +118,8 @@ fn scan_classifies_create_rebuild_rename_restore_and_remove() {
         .unwrap();
     // E: mirrored, then the notebook was deleted on the Kindle.
     k.add_synthetic(ID_E, "Gone");
-    l.put(entry_at(&k, ID_E, "Gone", MirrorState::Current)).unwrap();
+    l.put(entry_at(&k, ID_E, "Gone", MirrorState::Current))
+        .unwrap();
     k.remove(ID_E);
 
     let sources = k.sources();
@@ -231,4 +232,56 @@ fn scan_is_stat_only_and_leaves_amazon_storage_untouched() {
     let l = MirrorLedger::open(s.lib.root()).unwrap();
     scan(&k.sources(), &l).unwrap();
     assert_eq!(before, k.fingerprint());
+}
+
+#[test]
+fn scan_with_a_configured_but_missing_catalog_takes_no_action() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    k.add_synthetic(ID_B, "Two");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "One", MirrorState::Current))
+        .unwrap();
+    let before = l.data.clone();
+    fs::remove_file(&k.catalog).unwrap();
+    assert_eq!(scan(&k.sources(), &l).unwrap(), MirrorScan::default());
+    assert_eq!(l.data, before);
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, before);
+}
+
+#[test]
+fn a_source_vanishing_between_discover_and_stamp_is_skipped() {
+    // The race itself cannot be provoked deterministically; cover the classification the
+    // skip branch in `scan` relies on: a vanished directory is a NotFound stat error.
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "One");
+    let dir = k.root.join(ID_A);
+    fs::remove_dir_all(&dir).unwrap();
+    assert!(stamp_source(&dir).is_err());
+    assert_eq!(
+        try_stamp(&dir).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn rebuilding_and_stampless_unsupported_sources_that_are_present_rebuild() {
+    let k = Kindle::new();
+    k.add_synthetic(ID_A, "Half");
+    k.add_synthetic(ID_B, "Odd");
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    l.put(entry_at(&k, ID_A, "Half", MirrorState::Rebuilding))
+        .unwrap();
+    let mut e = entry(ID_B, MirrorState::Unsupported);
+    e.error = Some("x".into());
+    l.put(e).unwrap();
+    let got = scan(&k.sources(), &l).unwrap();
+    assert!(got.unsupported.is_empty());
+    assert!(matches!(
+        got.actions.as_slice(),
+        [MirrorAction::Rebuild { source: a, .. }, MirrorAction::Rebuild { source: b, .. }]
+            if a.origin_id == ID_A && b.origin_id == ID_B
+    ));
 }

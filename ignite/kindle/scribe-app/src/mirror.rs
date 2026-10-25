@@ -41,7 +41,7 @@ pub struct SourceStamp {
     pub actions_mtime_ms: u64,
 }
 
-fn file_stamp(path: &Path, required: bool) -> Result<(u64, u64), String> {
+fn file_stamp(path: &Path, required: bool) -> std::io::Result<(u64, u64)> {
     match fs::metadata(path) {
         Ok(m) => {
             let ms = m
@@ -52,12 +52,11 @@ fn file_stamp(path: &Path, required: bool) -> Result<(u64, u64), String> {
             Ok((m.len(), ms))
         }
         Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => Ok((0, 0)),
-        Err(e) => Err(format!("stat {}: {e}", path.display())),
+        Err(e) => Err(e),
     }
 }
 
-/// Stamp a source notebook directory. Metadata only; an absent `actions.log` stamps as zeros.
-pub fn stamp_source(dir: &Path) -> Result<SourceStamp, String> {
+fn try_stamp(dir: &Path) -> std::io::Result<SourceStamp> {
     let (nbk_len, nbk_mtime_ms) = file_stamp(&dir.join("nbk"), true)?;
     let (actions_len, actions_mtime_ms) = file_stamp(&dir.join("actions.log"), false)?;
     Ok(SourceStamp {
@@ -66,6 +65,11 @@ pub fn stamp_source(dir: &Path) -> Result<SourceStamp, String> {
         actions_len,
         actions_mtime_ms,
     })
+}
+
+/// Stamp a source notebook directory. Metadata only; an absent `actions.log` stamps as zeros.
+pub fn stamp_source(dir: &Path) -> Result<SourceStamp, String> {
+    try_stamp(dir).map_err(|e| format!("stat {}: {e}", dir.display()))
 }
 
 // ------------------------------------------------------------------------------ ledger
@@ -245,12 +249,24 @@ pub struct MirrorScan {
 /// Classify every Amazon notebook against the ledger. Metadata only, never decodes.
 /// `discover`'s error is returned as-is; a missing catalog or notebooks root is just empty.
 pub fn scan(src: &ImportSources, ledger: &MirrorLedger) -> Result<MirrorScan, String> {
+    // A configured catalog that is missing gives only an untrusted directory listing (every
+    // title would fall back); take no action rather than rename or remove from that view.
+    if src.catalog.as_ref().is_some_and(|c| !c.is_file()) {
+        return Ok(MirrorScan::default());
+    }
     let sources = discover(src)?;
     let mut out = MirrorScan::default();
     let mut present = std::collections::BTreeSet::new();
     for source in sources {
         present.insert(source.origin_id.clone());
-        let stamp = stamp_source(&source.dir)?;
+        let stamp = match try_stamp(&source.dir) {
+            Ok(st) => st,
+            // Deleted between discover and stamp: skip it this round (no action either way).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(e) => return Err(format!("stat {}: {e}", source.dir.display())),
+        };
         let Some(entry) = ledger.data.entries.get(&source.origin_id) else {
             out.actions.push(MirrorAction::Create { source, stamp });
             continue;
