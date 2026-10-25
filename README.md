@@ -32,6 +32,8 @@ Kindles, and **optional** self-hosted sync.
 - Multi-stroke notebook editing on Kindle Scribe
 - On-device library, tools, and durable page storage
 - One-file customer installer (`Install Ignite vX.Y.Z.sh`) plus Diagnose / Backup / Uninstall helpers
+- Nine built-in page templates plus custom PNG templates, chosen when creating a notebook or inserting a page
+- `TODAY` daily page (one notebook per month, one page per day) and `CAPTURE` side-button quick capture into an `Inbox` notebook
 - Optional LAN sync with a self-hosted **Ignite Server** and browser companion
 - This is a work in progress; new features are still being added
 

@@ -139,3 +139,33 @@ mirror you deleted in Ignite is recreated at the source's next change.
 
 **Log lines.** `mirror_scan`, `mirror_step` and `mirror_recovered` appear in
 the app log.
+
+## Templates, Daily page and Capture
+
+See `docs/architecture.md` for how these work.
+
+**Custom PNG not listed, or listed as unreadable.** Copy it over USB to
+`<library root>/templates/custom/` (default `/mnt/us/scribe-data/templates/custom/`).
+It is listed by file name without extension. A file that is not a decodable
+PNG is shown as unreadable and skipped; re-export it as PNG. Picking a
+template that fails to load shows `That template couldn't be loaded.` and
+creates nothing.
+
+**`Clock not set` / `Set the Kindle clock first.`** `TODAY` needs the Kindle's
+clock; one reading before 2025 creates nothing. Set the clock, then retry.
+(`CAPTURE` still works with the clock unset, but skips the time stamp.)
+
+**Where did `Daily` or `Inbox` go?** Both are tracked by id, so renaming or
+moving them is fine; look for the renamed notebook or folder. A deleted month
+notebook is recreated at the next `TODAY`, a deleted `Daily` folder at the next
+month. A corrupt `<library root>/.scribe-daily/daily.json` shows an error and
+creates nothing; `<library root>/.scribe-capture/capture.json` tracks the
+Inbox the same way. `Couldn't open the Inbox.` means the capture failed.
+
+**An empty capture page vanished.** By design: leaving a capture page
+discards it if nothing was written, it has no links or text beyond the stamp,
+and it is not the Inbox's only page.
+
+**Log lines.** `template_load_failed`, `daily_stamped`, `daily_open_failed`,
+`daily_open_refused`, `capture_stamped`, `capture_stamp_skipped`,
+`capture_discarded`, `capture_discard_failed`, `capture_failed`.
