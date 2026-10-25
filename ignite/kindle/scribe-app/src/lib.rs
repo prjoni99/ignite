@@ -9,6 +9,7 @@ pub mod app_ui;
 mod background_identity_tests;
 pub mod cadence;
 pub mod chrome;
+pub mod clock;
 pub mod content;
 pub mod discovery;
 pub mod display_events;

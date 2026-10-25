@@ -52,6 +52,8 @@ fontdue = { version = "0.9", default-features = false }
 # Template store: built-in page backgrounds + custom PNG decoding (pure Rust).
 page-templates = { path = "../../core/page-templates" }
 png = "0.17"
+# Local clock via localtime_r (reads the device /etc/localtime).
+libc = "0.2"
 
 [dev-dependencies]
 # Host-side integration tests (never linked into the Kindle binary).

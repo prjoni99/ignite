@@ -923,6 +923,7 @@ dependencies = [
  "ctrlc",
  "fontdue",
  "kindle-platform",
+ "libc",
  "mdns-sd",
  "nbk-reader",
  "notebook-core",
