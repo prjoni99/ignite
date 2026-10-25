@@ -324,7 +324,9 @@ fn content_hash_is_stable_and_ignores_diagnostics_and_book_id() {
     b.pages[0].strokes[0].diagnostics = vec!["note".into()];
     let h = content_hash(&a);
     assert_eq!(h.len(), 64);
-    assert!(h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
+    assert!(h
+        .bytes()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)));
     assert_eq!(h, content_hash(&a));
     assert_eq!(h, content_hash(&b));
 
@@ -340,11 +342,122 @@ fn content_hash_is_stable_and_ignores_diagnostics_and_book_id() {
 #[test]
 fn decode_errors_split_into_transient_and_permanent() {
     use nbk_reader::NbkError;
-    assert!(matches!(classify_decode_error(&NbkError::PendingActions { nbk_strokes: 1, action_stroke_inserts: 2 }), DecodeFailure::Transient(_)));
-    for e in [NbkError::Io("x".into()), NbkError::SourceBusy("x".into()), NbkError::SourceChanged("x".into())] {
-        assert!(matches!(classify_decode_error(&e), DecodeFailure::Transient(_)));
+    assert!(matches!(
+        classify_decode_error(&NbkError::PendingActions {
+            nbk_strokes: 1,
+            action_stroke_inserts: 2
+        }),
+        DecodeFailure::Transient(_)
+    ));
+    for e in [
+        NbkError::Io("x".into()),
+        NbkError::SourceBusy("x".into()),
+        NbkError::SourceChanged("x".into()),
+    ] {
+        assert!(matches!(
+            classify_decode_error(&e),
+            DecodeFailure::Transient(_)
+        ));
     }
-    for e in [NbkError::Container("x".into()), NbkError::Unsupported("x".into())] {
-        assert!(matches!(classify_decode_error(&e), DecodeFailure::Permanent(_)));
+    for e in [
+        NbkError::Container("x".into()),
+        NbkError::Unsupported("x".into()),
+    ] {
+        assert!(matches!(
+            classify_decode_error(&e),
+            DecodeFailure::Permanent(_)
+        ));
     }
+}
+
+// ------------------------------------------------------------------------------ folders and sync hooks
+
+#[test]
+fn ensure_folder_creates_once_and_reuses_even_after_rename() {
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let mut f = crate::folders::FolderStore::open(s.lib.root());
+    let live = s.lib.manifest().notebook_ids.clone();
+    let a = ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap();
+    assert_eq!(f.title(&a), Some(AMAZON_FOLDER_TITLE));
+    assert_eq!(l.data.amazon_folder.as_deref(), Some(a.as_str()));
+    assert_eq!(l.data.removed_folder, None);
+    assert_eq!(
+        ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap(),
+        a
+    );
+    f.rename(&a, "Kindle", &live).unwrap();
+    assert_eq!(
+        ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap(),
+        a
+    );
+    assert_eq!(f.title(&a), Some("Kindle"));
+    let r = ensure_folder(&mut l, &mut f, &live, Which::Removed, &NoSync).unwrap();
+    assert_ne!(r, a);
+    assert_eq!(f.title(&r), Some(REMOVED_FOLDER_TITLE));
+    assert_eq!(l.data.amazon_folder.as_deref(), Some(a.as_str()));
+    assert_eq!(MirrorLedger::open(s.lib.root()).unwrap().data, l.data);
+}
+
+#[test]
+fn ensure_folder_recreates_when_the_user_deleted_it() {
+    let s = Scribe::new();
+    let mut l = MirrorLedger::open(s.lib.root()).unwrap();
+    let mut f = crate::folders::FolderStore::open(s.lib.root());
+    let live = s.lib.manifest().notebook_ids.clone();
+    let a = ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap();
+    f.delete(&a, &live).unwrap();
+    let b = ensure_folder(&mut l, &mut f, &live, Which::Amazon, &NoSync).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(f.title(&b), Some(AMAZON_FOLDER_TITLE));
+    assert_eq!(l.data.amazon_folder.as_deref(), Some(b.as_str()));
+}
+
+fn two_page_notebook(s: &mut Scribe, id: &str) -> PathBuf {
+    let g = geo();
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut t = crate::nbk_import::ImportTarget {
+        library: &mut s.lib,
+        profile: &s.profile,
+        geo: &g,
+        paper: &s.paper,
+        cancel: &cancel,
+    };
+    crate::nbk_import::build(
+        &mut t,
+        id,
+        "Old",
+        &[vec![], vec![]],
+        ("m.json", b"{}"),
+        &NoSync,
+    )
+    .unwrap();
+    s.lib.notebook_dir(id)
+}
+
+#[test]
+fn no_sync_delete_page_removes_the_page() {
+    let mut s = Scribe::new();
+    let dir = two_page_notebook(&mut s, "notebook-7");
+    let mut m = crate::library::read_notebook_manifest_read_only(&dir).unwrap();
+    let gone = m.page_ids[0].clone();
+    NoSync
+        .delete_page(&dir, &mut m, "notebook-7", &gone)
+        .unwrap();
+    assert_eq!(m.page_ids.len(), 1);
+    let re = crate::library::read_notebook_manifest_read_only(&dir).unwrap();
+    assert_eq!(re.page_ids, m.page_ids);
+    assert!(!re.page_ids.contains(&gone));
+}
+
+#[test]
+fn no_sync_rename_notebook_retitles_it() {
+    let mut s = Scribe::new();
+    two_page_notebook(&mut s, "notebook-7");
+    NoSync
+        .rename_notebook(&mut s.lib, "notebook-7", "New")
+        .unwrap();
+    assert_eq!(s.lib.title("notebook-7").unwrap(), "New");
+    s.reopen();
+    assert_eq!(s.lib.title("notebook-7").unwrap(), "New");
 }

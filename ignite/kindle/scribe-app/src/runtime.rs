@@ -2396,7 +2396,7 @@ fn refresh_folder_view(ui: &mut UiState, folders: &FolderStore, library: &Librar
 
 /// Run one folder-store mutation from the UI; failures become an error modal.
 /// A committed local folder change to capture for sync (post-commit).
-enum FolderCapture {
+pub(crate) enum FolderCapture {
     Created(String),
     Renamed(String),
     /// Global identity resolved before the local delete.
@@ -2411,7 +2411,7 @@ enum FolderCapture {
 
 /// Capture a committed folder change (no-op while sync is off or faulted). Global folder IDs
 /// come from the folder store; the notebook's from the sync identity map.
-fn capture_folder_change(folders: &FolderStore, change: FolderCapture) {
+pub(crate) fn capture_folder_change(folders: &FolderStore, change: FolderCapture) {
     crate::sync_outbound::with_global(|s| {
         let library = s.library_id();
         let gid = |local: &str| folders.sync_id(local, library);

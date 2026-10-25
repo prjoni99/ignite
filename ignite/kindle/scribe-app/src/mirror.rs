@@ -16,7 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::nbk_import::{discover, write_atomic, ImportSources, SourceNotebook};
+use crate::folders::FolderStore;
+use crate::library::{rename_notebook_durable, LibraryRepository, RenameNotebookHooks};
+use crate::nbk_import::{
+    discover, write_atomic, GlobalSync, ImportSources, ImportSync, NoSync, SourceNotebook,
+};
+use crate::notebook::{delete_page_durable, DeletePageHooks, PersistedNotebookManifestV1};
+use crate::runtime::{capture_folder_change, FolderCapture};
 
 // ------------------------------------------------------------------------------ constants
 
@@ -366,6 +372,139 @@ pub fn content_hash(nb: &nbk_reader::DecodedNotebook) -> String {
         }
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ------------------------------------------------------------------------------ sync hooks
+
+/// Mirror mutations beyond what [`ImportSync`] covers. `GlobalSync` follows the runtime's
+/// prepare/commit discipline; `NoSync` is the plain durable write.
+pub(crate) trait MirrorSync: ImportSync {
+    fn delete_page(
+        &self,
+        nb_dir: &Path,
+        manifest: &mut PersistedNotebookManifestV1,
+        notebook_id: &str,
+        page_id: &str,
+    ) -> Result<(), String>;
+    fn rename_notebook(
+        &self,
+        library: &mut LibraryRepository,
+        notebook_id: &str,
+        title: &str,
+    ) -> Result<(), String>;
+    fn folder_changed(&self, folders: &FolderStore, change: FolderCapture);
+}
+
+impl MirrorSync for NoSync {
+    fn delete_page(
+        &self,
+        nb_dir: &Path,
+        manifest: &mut PersistedNotebookManifestV1,
+        _: &str,
+        page_id: &str,
+    ) -> Result<(), String> {
+        delete_page_durable(nb_dir, manifest, page_id, &DeletePageHooks::default()).map(|_| ())
+    }
+    fn rename_notebook(
+        &self,
+        library: &mut LibraryRepository,
+        notebook_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        rename_notebook_durable(library, notebook_id, title, &RenameNotebookHooks::default())
+            .map(|_| ())
+    }
+    fn folder_changed(&self, _: &FolderStore, _: FolderCapture) {}
+}
+
+impl MirrorSync for GlobalSync {
+    fn delete_page(
+        &self,
+        nb_dir: &Path,
+        manifest: &mut PersistedNotebookManifestV1,
+        notebook_id: &str,
+        page_id: &str,
+    ) -> Result<(), String> {
+        // None = sync off (no ticket); Some(None) = the journal could not record the edit.
+        let ticket = match crate::sync_outbound::with_global(|s| {
+            s.prepare_delete_page(notebook_id, page_id)
+        }) {
+            None => None,
+            Some(None) => return Err("local capture journal could not record this edit".into()),
+            Some(Some(t)) => Some(t),
+        };
+        let r = delete_page_durable(nb_dir, manifest, page_id, &DeletePageHooks::default());
+        if let Some(t) = ticket {
+            let ok = r.is_ok();
+            crate::sync_outbound::with_global(|s| if ok { s.commit(t) } else { s.abort(t) });
+        }
+        r.map(|_| ())
+    }
+    fn rename_notebook(
+        &self,
+        library: &mut LibraryRepository,
+        notebook_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let ticket = if library.title(notebook_id).ok() != Some(title) {
+            match crate::sync_outbound::with_global(|s| {
+                s.prepare_rename_notebook(notebook_id, title)
+            }) {
+                None => None,
+                Some(None) => return Err("local capture journal could not record this edit".into()),
+                Some(Some(t)) => Some(t),
+            }
+        } else {
+            None
+        };
+        let r =
+            rename_notebook_durable(library, notebook_id, title, &RenameNotebookHooks::default());
+        if let Some(t) = ticket {
+            let changed = r.as_ref().is_ok_and(|c| c.changed);
+            crate::sync_outbound::with_global(|s| if changed { s.commit(t) } else { s.abort(t) });
+        }
+        r.map(|_| ())
+    }
+    fn folder_changed(&self, folders: &FolderStore, change: FolderCapture) {
+        capture_folder_change(folders, change);
+    }
+}
+
+// ------------------------------------------------------------------------------ folders
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Which {
+    Amazon,
+    Removed,
+}
+
+/// The local folder for `which`: the ledger-recorded id while the folder still exists (a user
+/// rename keeps it), otherwise a freshly created one (the user deleted it), captured for sync
+/// and recorded in the ledger.
+pub(crate) fn ensure_folder(
+    ledger: &mut MirrorLedger,
+    folders: &mut FolderStore,
+    live: &[String],
+    which: Which,
+    sync: &dyn MirrorSync,
+) -> Result<String, String> {
+    let (recorded, title) = match which {
+        Which::Amazon => (&ledger.data.amazon_folder, AMAZON_FOLDER_TITLE),
+        Which::Removed => (&ledger.data.removed_folder, REMOVED_FOLDER_TITLE),
+    };
+    if let Some(id) = recorded {
+        if folders.title(id).is_some() {
+            return Ok(id.clone());
+        }
+    }
+    let id = folders.create(title, live)?;
+    sync.folder_changed(folders, FolderCapture::Created(id.clone()));
+    let (amazon, removed) = match which {
+        Which::Amazon => (Some(id.clone()), ledger.data.removed_folder.clone()),
+        Which::Removed => (ledger.data.amazon_folder.clone(), Some(id.clone())),
+    };
+    ledger.set_folders(amazon, removed)?;
+    Ok(id)
 }
 
 #[cfg(test)]
