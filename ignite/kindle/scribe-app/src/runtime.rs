@@ -65,21 +65,23 @@ use crate::nav::{dispatch_side_button, NavDownAction, NavGestureState, SideButto
 use crate::notebook::{
     allocate_page_id, commit_new_page_to_manifest, consume_dev_notebook_op,
     create_page_files_from_template, delete_page_durable, insert_page_after_durable,
-    load_page_for_switch, move_page_durable, page_index, peek_dev_notebook_op, persist_active_page,
-    DeletePageHooks, DevNotebookOp, InsertPageHooks, MovePageDirection, MovePageHooks,
-    NotebookOpen, PageSwitchDirection, PersistedNotebookManifestV1, QuarantineOutcome,
-    DEV_DELETE_CURRENT_PAGE_TRIGGER, DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER,
-    DEV_MOVE_PAGE_RIGHT_TRIGGER, NOTEBOOK_MANIFEST_VERSION,
+    insert_page_after_with_background, load_page_for_switch, move_page_durable, page_index,
+    peek_dev_notebook_op, persist_active_page, DeletePageHooks, DevNotebookOp, InsertPageHooks,
+    MovePageDirection, MovePageHooks, NotebookOpen, PageSwitchDirection,
+    PersistedNotebookManifestV1, QuarantineOutcome, DEV_DELETE_CURRENT_PAGE_TRIGGER,
+    DEV_INSERT_PAGE_AFTER_TRIGGER, DEV_MOVE_PAGE_LEFT_TRIGGER, DEV_MOVE_PAGE_RIGHT_TRIGGER,
+    NOTEBOOK_MANIFEST_VERSION,
 };
 use crate::open_page::BoundPageKey;
 use crate::orch::{
     dirty_to_send_rect, input_kernel_for_du_timing, require_eviocgrab, CtrlError, DuSendResult,
     InkTransport, StrokeController, UndoResult, WaitResult,
 };
-use crate::prefs::{self, SideButtonAction};
+use crate::prefs::{self, OpenAtLaunch, SideButtonAction};
 use crate::pressure::PressureStrokeSummary;
 use crate::profile::RenderProfile;
 use crate::store::{page_dir, resolve_data_dir, PageStore, RuntimeStore, DEFAULT_PAGE_ID};
+use crate::templates::{self, TemplateId};
 use crate::text_paint::TextOverlay;
 use crate::touch::{
     CoalesceDecision, FingerAction, MovePreviewCoalesce, TouchArbiter, TouchMapping,
@@ -319,6 +321,7 @@ impl KindleTransport {
         &mut self,
         action: SideButtonAction,
         mirror_enabled: bool,
+        open_at_launch: OpenAtLaunch,
         dialog: Option<&DialogSpec>,
     ) -> Result<(), String> {
         self.chrome_on_panel = false;
@@ -327,6 +330,7 @@ impl KindleTransport {
             &self.geometry,
             action,
             mirror_enabled,
+            open_at_launch,
         )?;
         if let Some(spec) = dialog {
             render_dialog(self.fb.as_slice_mut(), &self.geometry, spec)?;
@@ -1275,7 +1279,7 @@ fn navigate(
     let repair_strokes = ctrl.session.committed_strokes().to_vec();
 
     let (new_store, loaded, created_now) = if creating {
-        match create_page_files_from_template(data_dir, &target_id, DEFAULT_PAGE_ID) {
+        match create_page_files_from_template(data_dir, &target_id, DEFAULT_PAGE_ID, None) {
             Ok(v) => (v.0, v.1, true),
             Err(e) => {
                 ctrl.totals.page_switch_failures += 1;
@@ -1575,29 +1579,35 @@ fn move_current_page(
     Ok(true)
 }
 
-/// F9: durable insert blank page after current. Binds/reconstructs the new page.
+/// F9: durable insert blank page after current. Binds/reconstructs the new page. With
+/// `background`, the new page uses that bitmap (a page template) instead of the current
+/// page's background.
 fn insert_page_after_current(
     data_dir: &Path,
     manifest: &mut PersistedNotebookManifestV1,
     ctrl: &mut KindleCtrl,
     notebook_profile: &RenderProfile,
     current_bg: &mut Vec<u8>,
+    background: Option<&[u8]>,
 ) -> Result<bool, String> {
     if !ctrl.is_idle() || ctrl.life().is_armed() {
         println!("page_insert_ignored reason=not_idle");
         return Ok(false);
     }
     let after_id = ctrl.session.page_id().to_string();
-    let commit =
-        match insert_page_after_durable(data_dir, manifest, &after_id, &InsertPageHooks::default())
-        {
-            Ok(c) => c,
-            Err(e) if e.starts_with("REFUSE PAGE INSERT") => {
-                println!("page_insert_refused detail={e}");
-                return Ok(false);
-            }
-            Err(e) => return Err(e),
-        };
+    let hooks = InsertPageHooks::default();
+    let inserted = match background {
+        None => insert_page_after_durable(data_dir, manifest, &after_id, &hooks),
+        Some(bg) => insert_page_after_with_background(data_dir, manifest, &after_id, bg, &hooks),
+    };
+    let commit = match inserted {
+        Ok(c) => c,
+        Err(e) if e.starts_with("REFUSE PAGE INSERT") => {
+            println!("page_insert_refused detail={e}");
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
     crate::sync_outbound::with_global(|s| {
         s.page_created(
             data_dir,
@@ -2232,6 +2242,14 @@ struct UiExec<'a> {
     overlay: &'a mut TouchOverlayDirty,
     cached_move_ids: &'a mut Option<HashSet<String>>,
     last_move_undo: &'a mut Option<MoveCommit>,
+    /// The bound notebook is the capture Inbox (set wherever a notebook is bound, from the
+    /// capture ledger; the side button's only hot-path test).
+    on_inbox: &'a mut bool,
+    /// Where a capture returns to (one deep; cleared on every way out of the Inbox).
+    return_slot: &'a mut Option<crate::capture::ReturnSlot>,
+    /// (notebook id, page id) of the page the current capture opened: the only page the
+    /// empty-capture discard may delete (cleared on every way out).
+    capture_page: &'a mut Option<(String, String)>,
 }
 
 /// One "Import all" run: the eligible sources still to import plus running totals.
@@ -2561,6 +2579,7 @@ fn present_ui(
             ctrl.transport_mut().render_preferences(
                 x.ui.side_button,
                 x.ui.mirror_enabled,
+                x.ui.open_at_launch,
                 dialog.as_ref(),
             )
         }
@@ -2673,6 +2692,7 @@ fn reload_after_inbound(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(),
     *x.notebook_dir = new_dir;
     *x.manifest = opened.manifest;
     *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
+    note_inbox_binding(x);
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
     *x.notebook_profile = profile;
@@ -2710,6 +2730,7 @@ fn install_active_notebook(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
     *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
+    note_inbox_binding(x);
     Ok(())
 }
 
@@ -2787,6 +2808,7 @@ fn open_notebook_from_ui(
     x.library
         .set_cached_page_count(&active, x.manifest.page_ids.len());
     *x.session_read_only = is_mirror_notebook_dir(x.notebook_dir);
+    note_inbox_binding(x);
     crate::launch_clock::mark("notebook_bind_end");
     x.ui.enter_notebook();
     println!(
@@ -3137,6 +3159,567 @@ fn remove_page_link(
     present_ui(x, ctrl, None)
 }
 
+/// Last used template: persisted (a failed save only loses the preselection) and preselected.
+fn remember_template(x: &mut UiExec<'_>, template: TemplateId) {
+    if let Err(e) = prefs::save_template(x.prefs_path, &template) {
+        eprintln!("template_pref_save_failed detail={e}");
+    }
+    x.ui.template = template;
+}
+
+/// Home: the main list with the active notebook selected.
+fn go_home(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    if x.ui.view == AppView::Sync {
+        crate::server_link::with_global(|l| l.send(crate::server_link::LinkCmd::LeaveSyncScreen));
+    }
+    ctrl.clear_pending_clean();
+    let total = x.library.manifest().notebook_ids.len();
+    x.ui.enter_home(active_notebook_index(x.library), total);
+    present_ui(x, ctrl, None)?;
+    println!(
+        "app_view=home selected_notebook={} active_notebook={}",
+        x.library.manifest().notebook_ids[x.ui.home.selected_index],
+        x.library.active_notebook_id()
+    );
+    Ok(())
+}
+
+/// After a notebook is bound: is it the Inbox? Anything else ends the capture, so the return
+/// slot goes with it.
+fn note_inbox_binding(x: &mut UiExec<'_>) {
+    *x.on_inbox = crate::capture::is_inbox(x.library.root(), &x.manifest.notebook_id);
+    if !*x.on_inbox {
+        *x.return_slot = None;
+        *x.capture_page = None;
+    }
+}
+
+/// An Inbox page is showing.
+fn on_capture_page(x: &UiExec<'_>, ctrl: &KindleCtrl) -> bool {
+    *x.on_inbox && x.ui.view == AppView::Notebook && ctrl.store().is_bound()
+}
+
+/// The capture is over: clear its page and, when the view is the very page it opened, discard
+/// that page if it was left untouched (no stroke ever, no link, no text beyond its stamp;
+/// never the only page), through the normal page-delete path (sync ticket, successor bind).
+/// A refused or failed delete keeps the page and never stops the navigation; only a
+/// post-commit `FATAL:` (the page is already gone) is propagated.
+fn discard_empty_capture(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    let current = (x.ui.view == AppView::Notebook && ctrl.store().is_bound()).then(|| {
+        (
+            x.manifest.notebook_id.clone(),
+            ctrl.session.page_id().to_string(),
+        )
+    });
+    let current = current.as_ref().map(|(n, p)| (n.as_str(), p.as_str()));
+    if !crate::capture::leaving(x.capture_page, current) {
+        return Ok(());
+    }
+    let page = ctrl.session.page_id().to_string();
+    let texts = match crate::store::load_page_texts(&page_dir(x.notebook_dir, &page)) {
+        Ok(t) => t.len(),
+        Err(e) => {
+            eprintln!("capture_discard_failed page={page} detail={e}");
+            return Ok(());
+        }
+    };
+    if !crate::capture::should_discard_on_leave(
+        ctrl.store().stroke_count(),
+        x.manifest.page_ids.len(),
+        ctrl.links().len(),
+        texts,
+    ) {
+        return Ok(());
+    }
+    match delete_current_page(
+        x.notebook_dir,
+        x.manifest,
+        ctrl,
+        x.notebook_profile,
+        x.current_bg,
+    ) {
+        Ok(deleted) => println!("capture_discarded page={page} deleted={deleted}"),
+        Err(e) if e.starts_with("FATAL:") => return Err(e),
+        Err(e) => eprintln!("capture_discard_failed page={page} detail={e}"),
+    }
+    Ok(())
+}
+
+/// Leaving an Inbox page other than by the side button (Home, another notebook, Today, a new
+/// capture, Tools/Preferences/Sync, exit): the discard rule applies once and the capture is
+/// over.
+fn leave_capture_page_if_empty(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    if on_capture_page(x, ctrl) {
+        *x.return_slot = None;
+    }
+    discard_empty_capture(x, ctrl)
+}
+
+/// Resolve (creating as needed) the Inbox and the page this capture writes on: a fresh Inbox
+/// reuses its first page, an Inbox whose only page is untouched reuses it as it is (stamp
+/// kept, none added), otherwise a page is appended (each durable write captured for sync).
+/// A new or freshly created page is stamped with the local time when the clock is set.
+fn open_capture(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+) -> Result<(String, String, bool), String> {
+    use crate::capture::{CapturePage, INBOX_TITLE};
+    let mut ledger = crate::capture::CaptureLedger::open(x.library.root())?;
+    let geo = x.geo;
+    let profile: &RenderProfile = x.notebook_profile;
+    let mut create = |library: &mut LibraryRepository| -> Result<String, String> {
+        let blank = TemplateId::Builtin { id: "blank".into() };
+        let paper = templates::bitmap(library.root(), &blank, &geo)?;
+        let commit = create_notebook_durable(
+            library,
+            profile,
+            &geo,
+            &paper,
+            Some(INBOX_TITLE),
+            &CreateNotebookHooks::default(),
+        )?;
+        sync_notebook_created(library, &commit.notebook_id, &commit.title);
+        println!(
+            "notebook_created notebook={} title={:?} manifest_persist_us={} source=capture",
+            commit.notebook_id, commit.title, commit.manifest_persist_us
+        );
+        Ok(commit.notebook_id)
+    };
+    let (notebook_id, created) =
+        crate::capture::resolve_inbox(&mut ledger, x.library, &mut create)?;
+    // The bound notebook's manifest lives in memory: a page for it is inserted there so
+    // memory == disk (the runtime's own insert path), any other notebook's on disk.
+    let bound =
+        ctrl.store().is_bound() && !*x.session_read_only && x.manifest.notebook_id == notebook_id;
+    let nb_dir = x.library.notebook_dir(&notebook_id);
+    let mut disk;
+    let manifest: &mut PersistedNotebookManifestV1 = if bound {
+        &mut *x.manifest
+    } else {
+        disk = crate::library::read_notebook_manifest_read_only(&nb_dir)?;
+        &mut disk
+    };
+    // The only page, if untouched, is reused (read from disk: the Inbox may not be bound).
+    let only_page_untouched = !created
+        && match manifest.page_ids.as_slice() {
+            [only] => {
+                let pd = page_dir(&nb_dir, only);
+                match (
+                    crate::store::ever_written_stroke_count(&pd),
+                    crate::store::load_page_links(&pd),
+                    crate::store::load_page_texts(&pd),
+                ) {
+                    (Ok(strokes), Ok(links), Ok(texts)) => {
+                        crate::capture::reuse_only_page(manifest, strokes, links.len(), texts.len())
+                    }
+                    (a, b, c) => {
+                        let detail = [a.err(), b.err(), c.err()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        eprintln!("capture_reuse_check_failed page={only} detail={detail}");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+    let page_id = match crate::capture::next_capture_page(manifest, created, only_page_untouched) {
+        CapturePage::ReuseUntouched(page_id) => {
+            println!("capture_reused_first_page notebook={notebook_id} page={page_id}");
+            return Ok((notebook_id, page_id, created));
+        }
+        CapturePage::ReuseFirst => manifest
+            .page_ids
+            .first()
+            .cloned()
+            .ok_or("inbox notebook has no page")?,
+        CapturePage::InsertAfter(after_page) => {
+            let commit = insert_page_after_durable(
+                &nb_dir,
+                manifest,
+                &after_page,
+                &InsertPageHooks::default(),
+            )?;
+            x.library
+                .set_cached_page_count(&notebook_id, manifest.page_ids.len());
+            crate::sync_outbound::with_global(|s| {
+                s.page_created(
+                    &nb_dir,
+                    &notebook_id,
+                    &commit.inserted_page_id,
+                    Some(&after_page),
+                )
+            });
+            println!(
+                "page_inserted after={after_page} new={} index={} manifest_persist_us={} page_count={} source=capture",
+                commit.inserted_page_id,
+                commit.insert_index,
+                commit.manifest_persist_us,
+                manifest.page_ids.len()
+            );
+            commit.inserted_page_id
+        }
+    };
+    match crate::clock::now_local() {
+        Some(now) => match crate::text_author::stamp_page(
+            &nb_dir,
+            &notebook_id,
+            &page_id,
+            &crate::clock::stamp(&now),
+        ) {
+            Ok(_) => println!("capture_stamped notebook={notebook_id} page={page_id}"),
+            Err(e) => {
+                eprintln!("capture_stamp_failed notebook={notebook_id} page={page_id} detail={e}")
+            }
+        },
+        None => println!("capture_stamp_skipped reason=clock_unset"),
+    }
+    Ok((notebook_id, page_id, created))
+}
+
+/// CAPTURE tile / side button off the Inbox: remember the page it came from (if any), then
+/// open a fresh Inbox page. A failure shows the error and leaves the view as it was.
+fn run_capture(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    leave_capture_page_if_empty(x, ctrl)?;
+    let from_page = x.ui.view == AppView::Notebook && ctrl.store().is_bound() && !*x.on_inbox;
+    *x.return_slot = from_page.then(|| crate::capture::ReturnSlot {
+        notebook_id: x.manifest.notebook_id.clone(),
+        page_id: ctrl.session.page_id().to_string(),
+    });
+    match open_capture(x, ctrl) {
+        Ok((notebook_id, page_id, created)) => {
+            println!(
+                "capture_open notebook={notebook_id} page={page_id} created={created} return={}",
+                x.return_slot.is_some()
+            );
+            show_daily_page(x, ctrl, &notebook_id, &page_id)?;
+            // Only once the page is actually showing (an open failure shows its error).
+            let showing = x.ui.view == AppView::Notebook
+                && ctrl.store().is_bound()
+                && x.manifest.notebook_id == notebook_id
+                && ctrl.session.page_id() == page_id;
+            *x.capture_page = showing.then_some((notebook_id, page_id));
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("capture_failed detail={e}");
+            *x.return_slot = None;
+            x.ui.show_error("Couldn't open the Inbox.");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+/// Side button on an Inbox page: drop the page if it stayed empty, then go back to the page
+/// the capture started from (its notebook if the page is gone; Home when nothing is
+/// remembered). Anywhere else (Home) it does nothing.
+fn run_capture_return(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<(), String> {
+    if !on_capture_page(x, ctrl) {
+        println!("capture_return_ignored view={:?}", x.ui.view);
+        return Ok(());
+    }
+    discard_empty_capture(x, ctrl)?;
+    let Some(slot) = x.return_slot.take() else {
+        println!("capture_return target=home");
+        return go_home(x, ctrl);
+    };
+    if !x
+        .library
+        .manifest()
+        .notebook_ids
+        .contains(&slot.notebook_id)
+    {
+        println!("capture_return target=home reason=notebook_gone");
+        return go_home(x, ctrl);
+    }
+    let dir = x.library.notebook_dir(&slot.notebook_id);
+    let page_exists = crate::library::read_notebook_manifest_read_only(&dir)
+        .map(|m| m.page_ids.contains(&slot.page_id))
+        .unwrap_or(false);
+    println!(
+        "capture_return notebook={} page={} page_exists={page_exists}",
+        slot.notebook_id, slot.page_id
+    );
+    if page_exists {
+        show_daily_page(x, ctrl, &slot.notebook_id, &slot.page_id)
+    } else {
+        open_notebook_from_ui(x, ctrl, &slot.notebook_id)
+    }
+}
+
+/// Result of [`open_today`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TodayOutcome {
+    Opened {
+        notebook_id: String,
+        page_id: String,
+        created: bool,
+    },
+    /// The device clock looks unset: nothing was created.
+    ClockUnset,
+}
+
+/// Resolve today's daily page, creating the `Daily` folder, the month notebook or the day page
+/// as needed (each durable write captured for sync; new pages stamped with the date). Showing
+/// it is [`show_daily_page`]'s job, so `Err` here is only a recoverable resolution failure.
+fn open_today(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<TodayOutcome, String> {
+    let Some(now) = crate::clock::now_local() else {
+        return Ok(TodayOutcome::ClockUnset);
+    };
+    let mut ledger = crate::daily::DailyLedger::open(x.library.root())?;
+    // The bound notebook's manifest lives in memory: a day page for it is inserted there so
+    // memory == disk (the runtime's own insert path), any other notebook's on disk.
+    let bound =
+        (ctrl.store().is_bound() && !*x.session_read_only).then(|| x.manifest.notebook_id.clone());
+    let geo = x.geo;
+    let profile: &RenderProfile = x.notebook_profile;
+    let bound_manifest: &mut PersistedNotebookManifestV1 = x.manifest;
+    let mut create = |what: crate::daily::CreateWhat,
+                      library: &mut LibraryRepository,
+                      folders: &mut FolderStore|
+     -> Result<String, String> {
+        use crate::daily::CreateWhat;
+        match what {
+            CreateWhat::Folder => {
+                let live = library.manifest().notebook_ids.clone();
+                let id = folders.create(crate::daily::DAILY_FOLDER_TITLE, &live)?;
+                capture_folder_change(folders, FolderCapture::Created(id.clone()));
+                println!("folder_created folder={id} source=daily");
+                Ok(id)
+            }
+            CreateWhat::Month { title, folder_id } => {
+                let daily = TemplateId::Builtin { id: "daily".into() };
+                let paper = templates::bitmap(library.root(), &daily, &geo)?;
+                let commit = create_notebook_durable(
+                    library,
+                    profile,
+                    &geo,
+                    &paper,
+                    Some(&title),
+                    &CreateNotebookHooks::default(),
+                )?;
+                sync_notebook_created(library, &commit.notebook_id, &commit.title);
+                println!(
+                    "notebook_created notebook={} title={:?} manifest_persist_us={} source=daily folder={folder_id}",
+                    commit.notebook_id, commit.title, commit.manifest_persist_us
+                );
+                // The notebook exists either way; a filing failure only leaves it on the main
+                // list.
+                let live = library.manifest().notebook_ids.clone();
+                match folders.set_folder(&commit.notebook_id, Some(&folder_id), &live) {
+                    Ok(()) => capture_folder_change(
+                        folders,
+                        FolderCapture::Filed {
+                            notebook: commit.notebook_id.clone(),
+                            folder: Some(folder_id),
+                        },
+                    ),
+                    Err(e) => eprintln!(
+                        "folder_membership_changed_failed notebook={} detail={e}",
+                        commit.notebook_id
+                    ),
+                }
+                Ok(commit.notebook_id)
+            }
+            CreateWhat::Day {
+                notebook_id,
+                after_page,
+            } => {
+                let nb_dir = library.notebook_dir(&notebook_id);
+                let mut disk;
+                let manifest: &mut PersistedNotebookManifestV1 =
+                    if bound.as_deref() == Some(notebook_id.as_str()) {
+                        &mut *bound_manifest
+                    } else {
+                        disk = crate::library::read_notebook_manifest_read_only(&nb_dir)?;
+                        &mut disk
+                    };
+                let commit = crate::daily::insert_day_page(
+                    library.root(),
+                    &nb_dir,
+                    manifest,
+                    &after_page,
+                    &geo,
+                )?;
+                library.set_cached_page_count(&notebook_id, manifest.page_ids.len());
+                crate::sync_outbound::with_global(|s| {
+                    s.page_created(
+                        &nb_dir,
+                        &notebook_id,
+                        &commit.inserted_page_id,
+                        Some(&after_page),
+                    )
+                });
+                println!(
+                    "page_inserted after={after_page} new={} index={} manifest_persist_us={} page_count={} source=daily",
+                    commit.inserted_page_id,
+                    commit.insert_index,
+                    commit.manifest_persist_us,
+                    manifest.page_ids.len()
+                );
+                Ok(commit.inserted_page_id)
+            }
+        }
+    };
+    let (notebook_id, page_id, created) =
+        crate::daily::resolve_today(&mut ledger, x.library, x.folders, &now, &mut create)?;
+    Ok(TodayOutcome::Opened {
+        notebook_id,
+        page_id,
+        created,
+    })
+}
+
+/// TODAY / open-at-launch Today. A clock that looks unset shows the notice; a resolution
+/// failure is logged (and shown, except at launch) and leaves the view as it was. `Err` is
+/// fatal (a failure binding the resolved page).
+fn run_open_today(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    at_launch: bool,
+) -> Result<(), String> {
+    let source = if at_launch { "launch" } else { "ui" };
+    match open_today(x, ctrl) {
+        Ok(TodayOutcome::Opened {
+            notebook_id,
+            page_id,
+            created,
+        }) => {
+            println!(
+                "daily_open notebook={notebook_id} page={page_id} created={created} source={source}"
+            );
+            show_daily_page(x, ctrl, &notebook_id, &page_id)
+        }
+        Ok(TodayOutcome::ClockUnset) => {
+            println!("daily_open_refused reason=clock_unset source={source}");
+            x.ui.show_modal(Modal::clock_unset_notice());
+            present_ui(x, ctrl, None)
+        }
+        Err(e) => {
+            eprintln!("daily_open_failed source={source} detail={e}");
+            if !at_launch {
+                x.ui.show_error("Today's page couldn't be opened.");
+            }
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
+/// Show `page_id` of `notebook_id`: a notebook that is not the bound one opens straight on the
+/// page (its remembered selection is set first, so one paint); the bound one switches page.
+fn show_daily_page(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    notebook_id: &str,
+    page_id: &str,
+) -> Result<(), String> {
+    x.ui.modal = None;
+    let bound_here = ctrl.store().is_bound()
+        && !*x.session_read_only
+        && notebook_id == x.manifest.notebook_id
+        && notebook_id == x.library.active_notebook_id();
+    if bound_here {
+        let title = x.library.title(notebook_id)?.to_string();
+        ctrl.transport_mut().set_chrome_title(&title);
+        x.ui.enter_notebook();
+    } else {
+        let dir = x.library.notebook_dir(notebook_id);
+        match crate::library::read_notebook_manifest_read_only(&dir)
+            .and_then(|mut m| persist_active_page(&dir, &mut m, page_id))
+        {
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: daily_select_page_failed page={page_id} detail={e}"),
+        }
+        open_notebook_from_ui(x, ctrl, notebook_id)?;
+        // The open failed (its error is showing) or already landed on the page.
+        if x.ui.view != AppView::Notebook
+            || x.manifest.notebook_id != notebook_id
+            || ctrl.session.page_id() == page_id
+        {
+            return Ok(());
+        }
+    }
+    if ctrl.session.page_id() != page_id {
+        bind_existing_page(
+            x.notebook_dir,
+            x.manifest,
+            ctrl,
+            x.notebook_profile,
+            x.current_bg,
+            page_id,
+        )?;
+    }
+    present_ui(x, ctrl, None)
+}
+
+/// UI notebook create: the first page's background is `paper`; filed in `folder_id` when set;
+/// `template` is remembered as the last used once the notebook exists.
+fn create_notebook_from_ui(
+    x: &mut UiExec<'_>,
+    ctrl: &mut KindleCtrl,
+    title: &str,
+    folder_id: Option<&str>,
+    paper: &[u8],
+    template: Option<TemplateId>,
+) -> Result<(), String> {
+    match create_notebook_durable(
+        x.library,
+        x.notebook_profile,
+        &x.geo,
+        paper,
+        Some(title),
+        &CreateNotebookHooks::default(),
+    ) {
+        Ok(commit) => {
+            sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
+            let folder_log = folder_id
+                .map(|f| format!(" folder={f}"))
+                .unwrap_or_default();
+            println!(
+                "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui{folder_log}",
+                commit.notebook_id,
+                commit.title,
+                commit.manifest_persist_us,
+                x.library.active_notebook_id()
+            );
+            if let Some(folder_id) = folder_id {
+                // The notebook exists either way; a filing failure only leaves it on the
+                // main list.
+                let live = x.library.manifest().notebook_ids.clone();
+                match x
+                    .folders
+                    .set_folder(&commit.notebook_id, Some(folder_id), &live)
+                {
+                    Ok(()) => capture_folder_change(
+                        x.folders,
+                        FolderCapture::Filed {
+                            notebook: commit.notebook_id.clone(),
+                            folder: Some(folder_id.to_string()),
+                        },
+                    ),
+                    Err(e) => eprintln!(
+                        "folder_membership_changed_failed notebook={} detail={e}",
+                        commit.notebook_id
+                    ),
+                }
+            }
+            if let Some(template) = template {
+                remember_template(x, template);
+            }
+            x.ui.enter_notebook();
+            install_active_notebook(x, ctrl)
+                .map_err(|e| format!("FATAL: notebook create committed but open failed: {e}"))
+        }
+        Err(e) => {
+            eprintln!("notebook_create_failed title={title:?} detail={e}");
+            x.ui.show_error("The notebook couldn't be created.");
+            present_ui(x, ctrl, None)
+        }
+    }
+}
+
 /// Execute one UI command. `Err` is fatal (fail closed); recoverable failures become an
 /// on-screen error dialog with details only in the log.
 fn execute_ui_command(
@@ -3159,6 +3742,7 @@ fn execute_ui_command(
         UiCommand::Redraw(Redraw::Full) => present_ui(x, ctrl, None),
         UiCommand::Redraw(Redraw::Region(r)) => present_ui(x, ctrl, Some(r)),
         UiCommand::OpenTools => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_tools();
             mirror_ui::refresh_tools(
                 x.ui,
@@ -3210,6 +3794,7 @@ fn execute_ui_command(
         }
         UiCommand::CopyMirror(notebook_id) => mirror_ui::copy(x, ctrl, &notebook_id),
         UiCommand::OpenPreferences => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_preferences();
             println!("app_view=preferences");
             present_ui(x, ctrl, None)
@@ -3225,6 +3810,25 @@ fn execute_ui_command(
             }
             present_ui(x, ctrl, None)
         }
+        UiCommand::SetOpenAtLaunch(open_at_launch) => {
+            match prefs::save_open_at_launch(x.prefs_path, open_at_launch) {
+                Ok(()) => {
+                    x.ui.open_at_launch = open_at_launch;
+                    println!("open_at_launch={open_at_launch:?}");
+                }
+                Err(e) => {
+                    eprintln!("preferences_save_failed detail={e}");
+                    x.ui.show_error("The preference couldn't be saved.");
+                }
+            }
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::OpenToday => {
+            leave_capture_page_if_empty(x, ctrl)?;
+            run_open_today(x, ctrl, false)
+        }
+        UiCommand::Capture => run_capture(x, ctrl),
+        UiCommand::CaptureReturn => run_capture_return(x, ctrl),
         UiCommand::BeginCreateLink { x: px, y: py } => begin_create_link(x, ctrl, px, py),
         UiCommand::LinkPickerCancel => leave_link_picker(x, ctrl),
         UiCommand::LinkPickerOpenNotebook(id) => open_picker_notebook(x, ctrl, &id),
@@ -3272,6 +3876,7 @@ fn execute_ui_command(
             present_ui(x, ctrl, None)
         }
         UiCommand::OpenSync => {
+            leave_capture_page_if_empty(x, ctrl)?;
             x.ui.enter_sync();
             crate::server_link::with_global(|l| {
                 l.send(crate::server_link::LinkCmd::EnterSyncScreen)
@@ -3326,24 +3931,17 @@ fn execute_ui_command(
             Ok(())
         }
         UiCommand::GoHome => {
-            if x.ui.view == AppView::Sync {
-                crate::server_link::with_global(|l| {
-                    l.send(crate::server_link::LinkCmd::LeaveSyncScreen)
-                });
-            }
-            ctrl.clear_pending_clean();
-            let total = x.library.manifest().notebook_ids.len();
-            x.ui.enter_home(active_notebook_index(x.library), total);
-            present_ui(x, ctrl, None)?;
-            println!(
-                "app_view=home selected_notebook={} active_notebook={}",
-                x.library.manifest().notebook_ids[x.ui.home.selected_index],
-                x.library.active_notebook_id()
-            );
-            Ok(())
+            leave_capture_page_if_empty(x, ctrl)?;
+            go_home(x, ctrl)
         }
-        UiCommand::ExitApp => request_app_exit(x, ctrl),
-        UiCommand::OpenNotebook(id) => open_notebook_from_ui(x, ctrl, &id),
+        UiCommand::ExitApp => {
+            leave_capture_page_if_empty(x, ctrl)?;
+            request_app_exit(x, ctrl)
+        }
+        UiCommand::OpenNotebook(id) => {
+            leave_capture_page_if_empty(x, ctrl)?;
+            open_notebook_from_ui(x, ctrl, &id)
+        }
         UiCommand::CreateFolder(title) => folder_mutation(
             x,
             ctrl,
@@ -3402,85 +4000,36 @@ fn execute_ui_command(
         ),
         UiCommand::CreateNotebookInFolder { title, folder_id } => {
             let paper = paper_background(&x.geo);
-            match create_notebook_durable(
-                x.library,
-                x.notebook_profile,
-                &x.geo,
-                &paper,
-                Some(&title),
-                &CreateNotebookHooks::default(),
-            ) {
-                Ok(commit) => {
-                    sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
-                    println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui folder={folder_id}",
-                        commit.notebook_id,
-                        commit.title,
-                        commit.manifest_persist_us,
-                        x.library.active_notebook_id()
-                    );
-                    // The notebook exists either way; a filing failure only leaves it on the
-                    // main list.
-                    let live = x.library.manifest().notebook_ids.clone();
-                    match x
-                        .folders
-                        .set_folder(&commit.notebook_id, Some(&folder_id), &live)
-                    {
-                        Ok(()) => capture_folder_change(
-                            x.folders,
-                            FolderCapture::Filed {
-                                notebook: commit.notebook_id.clone(),
-                                folder: Some(folder_id.clone()),
-                            },
-                        ),
-                        Err(e) => eprintln!(
-                            "folder_membership_changed_failed notebook={} detail={e}",
-                            commit.notebook_id
-                        ),
-                    }
-                    x.ui.enter_notebook();
-                    install_active_notebook(x, ctrl).map_err(|e| {
-                        format!("FATAL: notebook create committed but open failed: {e}")
-                    })
-                }
-                Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
-                    x.ui.show_error("The notebook couldn't be created.");
-                    present_ui(x, ctrl, None)
-                }
-            }
+            create_notebook_from_ui(x, ctrl, &title, Some(&folder_id), &paper, None)
         }
         UiCommand::CreateNotebook(title) => {
             let paper = paper_background(&x.geo);
-            match create_notebook_durable(
-                x.library,
-                x.notebook_profile,
-                &x.geo,
-                &paper,
-                Some(&title),
-                &CreateNotebookHooks::default(),
-            ) {
-                Ok(commit) => {
-                    sync_notebook_created(x.library, &commit.notebook_id, &commit.title);
-                    println!(
-                        "notebook_created notebook={} title={:?} manifest_persist_us={} active_notebook={} source=ui",
-                        commit.notebook_id,
-                        commit.title,
-                        commit.manifest_persist_us,
-                        x.library.active_notebook_id()
-                    );
-                    x.ui.enter_notebook();
-                    install_active_notebook(x, ctrl).map_err(|e| {
-                        format!("FATAL: notebook create committed but open failed: {e}")
-                    })
-                }
-                Err(e) => {
-                    eprintln!("notebook_create_failed title={title:?} detail={e}");
-                    x.ui.show_error("The notebook couldn't be created.");
-                    present_ui(x, ctrl, None)
-                }
-            }
+            create_notebook_from_ui(x, ctrl, &title, None, &paper, None)
         }
+        UiCommand::OpenTemplatePicker(purpose) => {
+            let entries = templates::list(x.library.root());
+            x.ui.open_template_picker(purpose, entries);
+            present_ui(x, ctrl, None)
+        }
+        UiCommand::CreateNotebookWithTemplate {
+            title,
+            folder_id,
+            template,
+        } => match templates::bitmap(x.library.root(), &template, &x.geo) {
+            Ok(paper) => create_notebook_from_ui(
+                x,
+                ctrl,
+                &title,
+                folder_id.as_deref(),
+                &paper,
+                Some(template),
+            ),
+            Err(e) => {
+                eprintln!("template_load_failed template={template:?} detail={e}");
+                x.ui.show_error("That template couldn't be loaded.");
+                present_ui(x, ctrl, None)
+            }
+        },
         UiCommand::RenameNotebook { notebook_id, title } => {
             let ticket = if x.library.title(&notebook_id).ok() != Some(title.as_str()) {
                 match sync_prepare(|s| s.prepare_rename_notebook(&notebook_id, &title)) {
@@ -3602,10 +4151,37 @@ fn execute_ui_command(
                 ctrl,
                 x.notebook_profile,
                 x.current_bg,
+                None,
             )? {
                 x.ui.show_error("A page couldn't be inserted.");
             }
             // Success already reconstructed; a refusal must repaint the (closed) menu away.
+            if x.ui.modal_open() {
+                present_ui(x, ctrl, None)?;
+            }
+            Ok(())
+        }
+        UiCommand::InsertPageWithTemplate(template) => {
+            let bitmap = match templates::bitmap(x.library.root(), &template, &x.geo) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("template_load_failed template={template:?} detail={e}");
+                    x.ui.show_error("That template couldn't be loaded.");
+                    return present_ui(x, ctrl, None);
+                }
+            };
+            if insert_page_after_current(
+                x.notebook_dir,
+                x.manifest,
+                ctrl,
+                x.notebook_profile,
+                x.current_bg,
+                Some(&bitmap),
+            )? {
+                remember_template(x, template);
+            } else {
+                x.ui.show_error("A page couldn't be inserted.");
+            }
             if x.ui.modal_open() {
                 present_ui(x, ctrl, None)?;
             }
@@ -3979,6 +4555,8 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let prefs_path = prefs::preferences_path(cfg.sync_dir.as_deref(), cfg.device_dir.as_deref());
     ui.side_button = prefs::load_side_button(&prefs_path);
     ui.mirror_enabled = prefs::load_mirror_enabled(&prefs_path);
+    ui.template = prefs::load_template(&prefs_path);
+    ui.open_at_launch = prefs::load_open_at_launch(&prefs_path);
     println!("mirror_amazon_enabled={}", ui.mirror_enabled);
     if product_sync {
         ui.enable_sync();
@@ -4048,6 +4626,10 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut mirror_clock = crate::mirror::MirrorClock::default();
     // Launch is unbound (Home); every bind path sets this from the notebook's marker.
     let mut session_read_only = false;
+    // Launch is unbound: not on the Inbox, nothing to return to.
+    let mut on_inbox = false;
+    let mut return_slot: Option<crate::capture::ReturnSlot> = None;
+    let mut capture_page: Option<(String, String)> = None;
     let mut read_only_hint_shown = false;
     let mut read_only_hint_due = false;
     let mut input_lag = crate::input_lag::InputLag::default();
@@ -4055,6 +4637,9 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
     let mut sync_capture_max_us = 0u64;
     let mut inbound_apply_count = 0u64;
     let mut inbound_apply_max_us = 0u64;
+    // Open-at-launch Today: once, at the first structural safe point after Home is painted.
+    let mut today_at_launch = ui.open_at_launch == OpenAtLaunch::Today;
+    println!("open_at_launch={:?}", ui.open_at_launch);
     let code = loop {
         crate::launch_diag::live().maybe_emit_stats();
         if stop.load(Ordering::SeqCst) {
@@ -4178,6 +4763,9 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     overlay: &mut overlay,
                     cached_move_ids: &mut cached_move_ids,
                     last_move_undo: &mut last_move_undo,
+                    on_inbox: &mut on_inbox,
+                    return_slot: &mut return_slot,
+                    capture_page: &mut capture_page,
                 }
             };
         }
@@ -4210,6 +4798,20 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                     stylus_mode_disarm_failed = disarm_fail;
                     break 1;
                 }
+            }
+            continue;
+        }
+
+        if structure_eligible && today_at_launch {
+            today_at_launch = false;
+            let result = run_open_today(&mut ui_exec!(), &mut ctrl, true);
+            crate::launch_clock::mark("today_open_end");
+            if let Err(e) = result {
+                eprintln!("error: open today at launch: {e}");
+                let (_c, safe, disarm_fail) = finish_shutdown(&mut ctrl, false);
+                shutdown_safe = safe;
+                stylus_mode_disarm_failed = disarm_fail;
+                break 1;
             }
             continue;
         }
@@ -4599,6 +5201,7 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                         &mut ctrl,
                         &notebook_profile,
                         &mut current_bg,
+                        None,
                     ),
                     DevNotebookOp::DeleteCurrent => delete_current_page(
                         &notebook_dir,
@@ -5114,6 +5717,12 @@ pub fn run_page_session(cfg: RuntimeConfig, stop: Arc<AtomicBool>) -> i32 {
                                     x: page.x,
                                     y: page.y,
                                 });
+                                continue;
+                            }
+                            SideButtonDispatch::Capture => {
+                                println!("capture_gesture on_inbox={on_inbox}");
+                                let _ = nav.on_down(NavDownAction::IgnoreNoInk);
+                                pending_ui = Some(crate::capture::capture_command_for(on_inbox));
                                 continue;
                             }
                             SideButtonDispatch::Nav(action) => {

@@ -67,7 +67,7 @@ mod tests {
         store.append_committed_stroke(&stroke("s-page-1")).unwrap();
         for i in 2..=n {
             let id = allocate_page_id(&man);
-            let (mut s, _) = create_page_files_from_template(&root, &id, "page-1").unwrap();
+            let (mut s, _) = create_page_files_from_template(&root, &id, "page-1", None).unwrap();
             s.append_committed_stroke(&stroke(&format!("s-page-{i}")))
                 .unwrap();
             commit_new_page_to_manifest(&root, &mut man, &id).unwrap();
@@ -179,7 +179,7 @@ mod tests {
         delete_page_durable(&root, &mut man, "page-2", &DeletePageHooks::default()).unwrap();
         assert_eq!(allocate_page_id(&man), "page-4");
         let id = allocate_page_id(&man);
-        create_page_files_from_template(&root, &id, "page-1").unwrap();
+        create_page_files_from_template(&root, &id, "page-1", None).unwrap();
         commit_new_page_to_manifest(&root, &mut man, &id).unwrap();
         assert_eq!(id, "page-4");
         assert_eq!(man.page_ids, vec!["page-1", "page-3", "page-4"]);

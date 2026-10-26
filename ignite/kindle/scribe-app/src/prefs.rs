@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::sync_local::DEFAULT_REPLICA_STATE_DIR;
+use crate::templates::TemplateId;
 
 pub const PREFERENCES_FILE: &str = "preferences.json";
 const PREFERENCES_VERSION: u32 = 1;
@@ -23,6 +24,19 @@ pub enum SideButtonAction {
     NavigationUndo,
     /// Capture the tap point and open the link-target picker.
     CreateLink,
+    /// Open a fresh Inbox page (on an Inbox page: return to where the capture started).
+    Capture,
+}
+
+/// Where Ignite goes when it starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAtLaunch {
+    /// The library (shipped default).
+    #[default]
+    Home,
+    /// Today's daily page.
+    Today,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +46,12 @@ struct PreferencesFile {
     /// Mirror Amazon's stock notebooks into the read-only Amazon folder. On by default.
     #[serde(default = "default_true")]
     mirror_amazon: bool,
+    /// Last template used when creating a notebook or inserting a page. Defaults to blank.
+    #[serde(default)]
+    template: TemplateId,
+    /// Where Ignite goes when it starts. Defaults to Home.
+    #[serde(default)]
+    open_at_launch: OpenAtLaunch,
 }
 
 fn default_true() -> bool {
@@ -44,6 +64,8 @@ impl Default for PreferencesFile {
             v: PREFERENCES_VERSION,
             side_button: SideButtonAction::NavigationUndo,
             mirror_amazon: true,
+            template: TemplateId::default(),
+            open_at_launch: OpenAtLaunch::Home,
         }
     }
 }
@@ -102,6 +124,34 @@ pub fn load_mirror_enabled(path: &Path) -> bool {
 pub fn save_mirror_enabled(path: &Path, enabled: bool) -> Result<(), String> {
     let file = PreferencesFile {
         mirror_amazon: enabled,
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+/// Load the last-used template. Missing/unreadable/malformed → `Builtin { id: "blank" }`.
+pub fn load_template(path: &Path) -> TemplateId {
+    load(path).template
+}
+
+/// Persist the last-used template, keeping the other preferences.
+pub fn save_template(path: &Path, id: &TemplateId) -> Result<(), String> {
+    let file = PreferencesFile {
+        template: id.clone(),
+        ..load(path)
+    };
+    write(path, &file)
+}
+
+/// Load the launch destination. Missing/unreadable/malformed → Home.
+pub fn load_open_at_launch(path: &Path) -> OpenAtLaunch {
+    load(path).open_at_launch
+}
+
+/// Persist the launch destination, keeping the other preferences.
+pub fn save_open_at_launch(path: &Path, open_at_launch: OpenAtLaunch) -> Result<(), String> {
+    let file = PreferencesFile {
+        open_at_launch,
         ..load(path)
     };
     write(path, &file)
@@ -246,6 +296,35 @@ mod tests {
     }
 
     #[test]
+    fn preferences_open_at_launch_round_trips() {
+        let p = temp_path("launch");
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Home);
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"create_link"}"#).open_at_launch,
+            OpenAtLaunch::Home
+        );
+        save_side_button(&p, SideButtonAction::CreateLink).unwrap();
+        save_mirror_enabled(&p, false).unwrap();
+        save_open_at_launch(&p, OpenAtLaunch::Today).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Today);
+        assert_eq!(load_side_button(&p), SideButtonAction::CreateLink);
+        assert!(!load_mirror_enabled(&p));
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains(r#""open_at_launch": "today""#));
+        save_side_button(&p, SideButtonAction::NavigationUndo).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Today);
+        save_open_at_launch(&p, OpenAtLaunch::Home).unwrap();
+        assert_eq!(load_open_at_launch(&p), OpenAtLaunch::Home);
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"create_link","open_at_launch":"never"}"#)
+                .open_at_launch,
+            OpenAtLaunch::Home
+        );
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
     fn path_prefers_sync_dir_then_device_dir() {
         let sync = Path::new("/tmp/sync");
         let device = Path::new("/tmp/device");
@@ -261,5 +340,20 @@ mod tests {
             preferences_path(None, None),
             PathBuf::from(DEFAULT_REPLICA_STATE_DIR).join(PREFERENCES_FILE)
         );
+    }
+
+    #[test]
+    fn side_button_capture_round_trips() {
+        let p = temp_path("capture");
+        save_side_button(&p, SideButtonAction::Capture).unwrap();
+        assert_eq!(load_side_button(&p), SideButtonAction::Capture);
+        let raw = fs::read_to_string(&p).unwrap();
+        assert!(raw.contains(r#""side_button": "capture""#), "{raw}");
+        assert_eq!(
+            parse_bytes(br#"{"v":1,"side_button":"capture"}"#).side_button,
+            SideButtonAction::Capture
+        );
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_dir(p.parent().unwrap());
     }
 }

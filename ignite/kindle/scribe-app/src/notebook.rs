@@ -455,6 +455,7 @@ pub fn create_page_files_from_template(
     data_dir: &Path,
     new_page_id: &str,
     template_page_id: &str,
+    background: Option<&[u8]>,
 ) -> Result<(FsPageStore, LoadedPage), String> {
     if page_exists(data_dir, new_page_id) {
         return Err(format!(
@@ -476,8 +477,18 @@ pub fn create_page_files_from_template(
             .line_length
             .saturating_mul(tmpl.header.panel_height),
     };
-    let mut bg = tmpl.background.clone();
-    scrub_chrome_band(&mut bg, &geo)?;
+    // A given background (page template bitmap) is used verbatim; the template page's own
+    // background has its chrome band scrubbed.
+    let scrubbed;
+    let bg: &[u8] = match background {
+        Some(b) => b,
+        None => {
+            let mut b = tmpl.background.clone();
+            scrub_chrome_band(&mut b, &geo)?;
+            scrubbed = b;
+            &scrubbed
+        }
+    };
     create_new_page(
         data_dir,
         new_page_id,
@@ -1012,14 +1023,40 @@ pub fn insert_page_after_durable(
     after_page_id: &str,
     hooks: &InsertPageHooks,
 ) -> Result<InsertPageCommit, String> {
+    // Template from the current page so profile/background match the notebook.
+    insert_page_after_with(data_dir, manifest, after_page_id, None, hooks)
+}
+
+/// Insert after `after_page_id` like [`insert_page_after_durable`], but the new page's
+/// `background.raw` is exactly `background` (a page template bitmap). Panel dimensions and the
+/// render profile come from the `after_page_id` page.
+pub fn insert_page_after_with_background(
+    data_dir: &Path,
+    manifest: &mut PersistedNotebookManifestV1,
+    after_page_id: &str,
+    background: &[u8],
+    hooks: &InsertPageHooks,
+) -> Result<InsertPageCommit, String> {
+    insert_page_after_with(data_dir, manifest, after_page_id, Some(background), hooks)
+}
+
+/// Shared insert sequence: plan, create the page files from the `after_page_id` page (with
+/// `background` when given), then commit the manifest (removing the new page directory if the
+/// commit fails).
+fn insert_page_after_with(
+    data_dir: &Path,
+    manifest: &mut PersistedNotebookManifestV1,
+    after_page_id: &str,
+    background: Option<&[u8]>,
+    hooks: &InsertPageHooks,
+) -> Result<InsertPageCommit, String> {
     let (planned, new_id, insert_at) = plan_insert_after(manifest, after_page_id)?;
     if !page_exists(data_dir, after_page_id) {
         return Err(format!(
             "REFUSE PAGE INSERT: after page directory {after_page_id} missing"
         ));
     }
-    // Template from the current page so profile/background match the notebook.
-    create_page_files_from_template(data_dir, &new_id, after_page_id)
+    create_page_files_from_template(data_dir, &new_id, after_page_id, background)
         .map_err(|e| format!("REFUSE PAGE INSERT: create page files failed: {e}"))?;
 
     let t0 = Instant::now();
@@ -1102,6 +1139,63 @@ mod tests {
             brush: None,
             finished: true,
         }
+    }
+
+    #[test]
+    fn insert_page_after_with_background_uses_the_given_bitmap() {
+        let root = tmp();
+        let g = geo();
+        let mut open = open_or_create_notebook(&root, InkRequest::Default, &g, &bg()).unwrap();
+        let plain = insert_page_after_durable(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &InsertPageHooks::default(),
+        )
+        .unwrap();
+        let bitmap: Vec<u8> = (0..800u32).map(|i| (i % 251) as u8).collect();
+        let commit = insert_page_after_with_background(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &bitmap,
+            &InsertPageHooks::default(),
+        )
+        .unwrap();
+        assert_eq!(commit.insert_index, 1);
+        assert_eq!(
+            open.manifest.page_ids,
+            vec![
+                "page-1".to_string(),
+                commit.inserted_page_id.clone(),
+                plain.inserted_page_id.clone()
+            ]
+        );
+        let raw = fs::read(root.join(&commit.inserted_page_id).join("background.raw")).unwrap();
+        assert_eq!(raw, bitmap);
+        let (_, loaded) = load_existing_page(&root, &commit.inserted_page_id).unwrap();
+        assert_eq!(loaded.background, bitmap);
+        assert_eq!(loaded.header.panel_width, 40);
+        assert_eq!(loaded.header.panel_height, 20);
+        // The manifest on disk is the committed order.
+        let on_disk: PersistedNotebookManifestV1 =
+            serde_json::from_str(&fs::read_to_string(manifest_path(&root)).unwrap()).unwrap();
+        assert_eq!(on_disk.page_ids, open.manifest.page_ids);
+        // A wrong-sized bitmap is refused and leaves nothing behind.
+        let before = open.manifest.clone();
+        let err = insert_page_after_with_background(
+            &root,
+            &mut open.manifest,
+            "page-1",
+            &[0u8; 7],
+            &InsertPageHooks::default(),
+        )
+        .unwrap_err();
+        assert!(err.starts_with("REFUSE PAGE INSERT"), "{err}");
+        assert_eq!(open.manifest, before);
+        let planned = plan_insert_after(&open.manifest, "page-1").unwrap().1;
+        assert!(!root.join(&planned).exists(), "{planned} left behind");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1212,7 +1306,7 @@ mod tests {
         let g = geo();
         let open = open_or_create_notebook(&root, InkRequest::Default, &g, &bg()).unwrap();
         let id = allocate_page_id(&open.manifest);
-        let (_s, loaded) = create_page_files_from_template(&root, &id, "page-1").unwrap();
+        let (_s, loaded) = create_page_files_from_template(&root, &id, "page-1", None).unwrap();
         assert_eq!(loaded.strokes.len(), 0);
         assert_eq!(loaded.render_profile, open.loaded.render_profile);
         assert_eq!(loaded.background, open.loaded.background);
@@ -1229,12 +1323,12 @@ mod tests {
         drop(store1);
         let mut man = open.manifest;
         let id2 = allocate_page_id(&man);
-        let (mut store2, _) = create_page_files_from_template(&root, &id2, "page-1").unwrap();
+        let (mut store2, _) = create_page_files_from_template(&root, &id2, "page-1", None).unwrap();
         store2.append_committed_stroke(&stroke("s-b")).unwrap();
         drop(store2);
         commit_new_page_to_manifest(&root, &mut man, &id2).unwrap();
         let id3 = allocate_page_id(&man);
-        let (mut store3, _) = create_page_files_from_template(&root, &id3, "page-1").unwrap();
+        let (mut store3, _) = create_page_files_from_template(&root, &id3, "page-1", None).unwrap();
         store3.append_committed_stroke(&stroke("s-c")).unwrap();
         drop(store3);
         commit_new_page_to_manifest(&root, &mut man, &id3).unwrap();
@@ -1257,7 +1351,7 @@ mod tests {
         let mut man = open.manifest;
         for _ in 2..=n {
             let id = allocate_page_id(&man);
-            let (_s, _) = create_page_files_from_template(&root, &id, "page-1").unwrap();
+            let (_s, _) = create_page_files_from_template(&root, &id, "page-1", None).unwrap();
             commit_new_page_to_manifest(&root, &mut man, &id).unwrap();
         }
         persist_active_page(&root, &mut man, "page-1").unwrap();

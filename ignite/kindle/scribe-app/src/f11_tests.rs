@@ -593,7 +593,13 @@ mod tests {
         let cmd = ui.on_tap(&g, UiPoint { x: 5, y: 5 }, &cards(2), "x", None);
         assert_eq!(cmd, UiCommand::None);
         let cmd = tap_key(&mut ui, &g, EditorKey::Submit);
-        assert_eq!(cmd, UiCommand::CreateNotebook("Work".into()));
+        assert_eq!(
+            cmd,
+            UiCommand::OpenTemplatePicker(crate::modal::PickerPurpose::NewNotebook {
+                title: "Work".into(),
+                folder_id: None,
+            })
+        );
         assert!(ui.modal.is_none());
     }
 

@@ -68,7 +68,7 @@ mod tests {
         store.append_committed_stroke(&stroke("s-page-1")).unwrap();
         for i in 2..=n {
             let id = allocate_page_id(&man);
-            let (mut s, _) = create_page_files_from_template(&root, &id, "page-1").unwrap();
+            let (mut s, _) = create_page_files_from_template(&root, &id, "page-1", None).unwrap();
             s.append_committed_stroke(&stroke(&format!("s-page-{i}")))
                 .unwrap();
             commit_new_page_to_manifest(&root, &mut man, &id).unwrap();

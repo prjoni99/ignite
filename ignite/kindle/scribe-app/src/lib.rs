@@ -8,8 +8,13 @@
 pub mod app_ui;
 mod background_identity_tests;
 pub mod cadence;
+pub mod capture;
 pub mod chrome;
+#[cfg(unix)]
+pub mod clock;
 pub mod content;
+#[cfg(unix)]
+pub mod daily;
 pub mod discovery;
 pub mod display_events;
 pub mod eraser;
@@ -101,6 +106,8 @@ mod sync_recovery_stream_tests;
 mod sync_recovery_supervise_tests;
 pub mod sync_ui;
 pub mod sync_verified;
+pub mod templates;
+pub mod text_author;
 pub mod text_paint;
 pub mod tools_ui;
 pub mod touch;

@@ -21,7 +21,7 @@ pub use crate::folders::FolderInfo;
 pub const ROWS_PER_PAGE: usize = 6;
 
 const MARGIN: u32 = 60;
-/// Compact top bar: [exit] [search placeholder] [sync] [+ new] [tools]. Every control keeps a
+/// Compact top bar: [exit] [search placeholder] [capture] [today] [sync] [+ new] [tools]. Every control keeps a
 /// >= 130 px (about 11 mm) pen/finger target.
 const BAR_Y: u32 = 36;
 const BAR_H: u32 = 130;
@@ -32,6 +32,12 @@ const NEW_W: u32 = 280;
 /// D1: the Sync entry point (product mode only), left of "+ NEW".
 const SYNC_W: u32 = 230;
 const TOOLS_W: u32 = BAR_H;
+/// Today's daily page, left of Sync (or of "+ NEW" without sync).
+const TODAY_W: u32 = NEW_W;
+/// Quick capture into the Inbox, left of Today.
+const CAPTURE_W: u32 = TODAY_W;
+/// `CAPTURE` is wider than `TODAY`: one step smaller so it fits the same tile.
+const CAPTURE_SCALE: u32 = 6;
 const DIVIDER_Y: u32 = 196;
 const CARDS_TOP: u32 = 232;
 const CARD_GAP: u32 = 24;
@@ -267,6 +273,10 @@ pub enum HomeHit {
     Sync,
     /// Tools screen (Import Kindle notebooks, ...).
     Tools,
+    /// Open (creating as needed) today's daily page.
+    Today,
+    /// Open a fresh page in the Inbox (creating it as needed).
+    Capture,
     /// Search placeholder: consumed, does nothing (search is not implemented yet).
     SearchPlaceholder,
 }
@@ -283,6 +293,10 @@ pub struct HomeLayout {
     /// D1: hit/drawn only when `HomeState::sync`.
     pub sync_button: Rect,
     pub tools_button: Rect,
+    /// Today's daily page, left of `sync_button` (of `new_button` without sync).
+    pub today_button: Rect,
+    /// Quick capture, left of `today_button`.
+    pub capture_button: Rect,
     /// `(library index, card rect, menu rect)` for the visible viewport page.
     pub cards: Vec<(usize, Rect, Rect)>,
     /// `(folder index, tile rect, menu rect)` for the visible viewport page.
@@ -353,13 +367,28 @@ impl HomeLayout {
             SYNC_W,
             BAR_H,
         );
-        let search_left = exit_hit.right() + BAR_GAP;
-        let search_right = if state.sync {
+        let today_right = if state.sync {
             sync_button.x
         } else {
             new_button.x
         }
         .saturating_sub(BAR_GAP);
+        // TODAY and CAPTURE live on the main list only: inside a folder the
+        // slot keeps its full width so the folder title is shown whole.
+        let (today_button, capture_button, search_right) = if in_folder {
+            (Rect::new(0, 0, 0, 0), Rect::new(0, 0, 0, 0), today_right)
+        } else {
+            let today = Rect::new(today_right.saturating_sub(TODAY_W), BAR_Y, TODAY_W, BAR_H);
+            let capture = Rect::new(
+                today.x.saturating_sub(BAR_GAP + CAPTURE_W),
+                BAR_Y,
+                CAPTURE_W,
+                BAR_H,
+            );
+            let right = capture.x.saturating_sub(BAR_GAP);
+            (today, capture, right)
+        };
+        let search_left = exit_hit.right() + BAR_GAP;
         let search = Rect::new(
             search_left,
             BAR_Y,
@@ -373,6 +402,8 @@ impl HomeLayout {
             new_button,
             sync_button,
             tools_button,
+            today_button,
+            capture_button,
             cards,
             folders,
             rows_len: all.len(),
@@ -406,6 +437,12 @@ impl HomeLayout {
         }
         if self.tools_button.contains(p.x, p.y) {
             return Some(HomeHit::Tools);
+        }
+        if !self.in_folder && self.today_button.contains(p.x, p.y) {
+            return Some(HomeHit::Today);
+        }
+        if !self.in_folder && self.capture_button.contains(p.x, p.y) {
+            return Some(HomeHit::Capture);
         }
         if self.search.contains(p.x, p.y) {
             return Some(HomeHit::SearchPlaceholder);
@@ -559,6 +596,11 @@ fn draw_tools_icon(c: &mut Canvas<'_>, r: Rect) {
     );
 }
 
+/// The open folder's title as drawn in the search slot (scale 8).
+fn folder_header_text(title: &str, search: Rect) -> String {
+    fit_text(title, 8, search.w.saturating_sub(40))
+}
+
 /// Notebooks only (no folders).
 pub fn render_home(
     fb: &mut [u8],
@@ -591,7 +633,7 @@ pub fn render_home_view(
     if let Some(f) = open_folder {
         draw_back_icon(&mut c, layout.exit_icon);
         // The folder's name where search sits on the main list (inert).
-        let name = fit_text(&f.title, 8, layout.search.w.saturating_sub(40));
+        let name = folder_header_text(&f.title, layout.search);
         c.text(
             layout.search.x + 20,
             layout.search.y + (BAR_H - GLYPH_H * 8) / 2,
@@ -609,6 +651,17 @@ pub fn render_home_view(
     if state.sync {
         c.frame(layout.sync_button, 4, BLACK);
         c.text_centered(layout.sync_button.inset(8), 8, "SYNC", BLACK);
+    }
+    if !layout.in_folder {
+        c.frame(layout.today_button, 4, BLACK);
+        c.text_centered(layout.today_button.inset(8), 8, "TODAY", BLACK);
+        c.frame(layout.capture_button, 4, BLACK);
+        c.text_centered(
+            layout.capture_button.inset(8),
+            CAPTURE_SCALE,
+            "CAPTURE",
+            BLACK,
+        );
     }
     c.fill(layout.new_button, BLACK);
     c.text_centered(layout.new_button.inset(8), 8, "+ NEW", WHITE);
@@ -833,9 +886,49 @@ mod tests {
         let l2 = HomeLayout::new(&g, &st, 3);
         assert!(l2.search.w > l.search.w);
         assert_eq!(
-            l2.hit(c(l.sync_button), &st, 3),
+            l2.hit(c(l.search), &st, 3),
             Some(HomeHit::SearchPlaceholder)
         );
+    }
+
+    #[test]
+    fn home_layout_has_a_today_tile_that_does_not_overlap_new() {
+        let g = panel_geo();
+        let c = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let disjoint = |a: Rect, b: Rect| a.right() <= b.x || b.right() <= a.x;
+        for sync in [true, false] {
+            let mut st = HomeState::selecting(0, 3);
+            st.sync = sync;
+            let l = HomeLayout::new(&g, &st, 3);
+            let t = l.today_button;
+            assert_eq!((t.y, t.h, t.w), (l.new_button.y, l.new_button.h, TODAY_W));
+            assert_eq!(TODAY_W, NEW_W);
+            assert!(t.w >= 130 && t.h >= 130);
+            assert!(disjoint(t, l.new_button) && disjoint(t, l.search));
+            // [search] [today] [sync] [+ new]: Today sits left of Sync (or of + NEW).
+            assert!(l.search.right() <= t.x);
+            if sync {
+                assert!(disjoint(t, l.sync_button));
+                assert_eq!(t.right() + BAR_GAP, l.sync_button.x);
+            } else {
+                assert_eq!(t.right() + BAR_GAP, l.new_button.x);
+            }
+            assert!(l.search.w >= 130, "{:?}", l.search);
+            assert_eq!(l.hit(c(t), &st, 3), Some(HomeHit::Today));
+            assert_eq!(l.hit(c(l.new_button), &st, 3), Some(HomeHit::New));
+        }
+        // Painted with its label (non-white pixels inside the tile).
+        let mut st = HomeState::selecting(0, 0);
+        st.sync = true;
+        let mut fb = vec![0x55; g.smem_len as usize];
+        render_home_view(&mut fb, &g, &[], &[], None, &st).unwrap();
+        let t = HomeLayout::new(&g, &st, 0).today_button.inset(12);
+        let inked = (t.y..t.bottom())
+            .any(|y| (t.x..t.right()).any(|x| fb[(y * g.line_length + x) as usize] != WHITE));
+        assert!(inked, "TODAY label painted");
     }
 
     #[test]
@@ -846,5 +939,89 @@ mod tests {
         assert!(!AppView::Preferences.allows_page_input());
         assert!(!AppView::LinkTargetPicker.allows_page_input());
         assert!(!AppView::Sync.allows_page_input());
+    }
+
+    #[test]
+    fn home_layout_has_a_capture_tile() {
+        let g = panel_geo();
+        let c = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        let disjoint = |a: Rect, b: Rect| a.right() <= b.x || b.right() <= a.x;
+        for sync in [true, false] {
+            let mut st = HomeState::selecting(0, 3);
+            st.sync = sync;
+            let l = HomeLayout::new(&g, &st, 3);
+            let k = l.capture_button;
+            assert_eq!((k.y, k.h, k.w), (l.today_button.y, BAR_H, CAPTURE_W));
+            assert_eq!(CAPTURE_W, TODAY_W);
+            // [search] [capture] [today] ...
+            assert_eq!(k.right() + BAR_GAP, l.today_button.x);
+            assert_eq!(l.search.right() + BAR_GAP, k.x);
+            let mut bar = vec![
+                l.exit_hit,
+                l.search,
+                k,
+                l.today_button,
+                l.new_button,
+                l.tools_button,
+            ];
+            if sync {
+                bar.push(l.sync_button);
+            }
+            for (i, a) in bar.iter().enumerate() {
+                assert!(a.w >= 130 && a.h >= 130, "{a:?}");
+                for b in &bar[i + 1..] {
+                    assert!(disjoint(*a, *b), "{a:?} overlaps {b:?}");
+                }
+            }
+            assert_eq!(l.hit(c(k), &st, 3), Some(HomeHit::Capture));
+            assert_eq!(l.hit(c(l.today_button), &st, 3), Some(HomeHit::Today));
+            assert_eq!(l.hit(c(l.search), &st, 3), Some(HomeHit::SearchPlaceholder));
+        }
+        // Painted with its label.
+        let mut st = HomeState::selecting(0, 0);
+        st.sync = true;
+        let mut fb = vec![0x55; g.smem_len as usize];
+        render_home_view(&mut fb, &g, &[], &[], None, &st).unwrap();
+        let k = HomeLayout::new(&g, &st, 0).capture_button.inset(12);
+        let inked = (k.y..k.bottom())
+            .any(|y| (k.x..k.right()).any(|x| fb[(y * g.line_length + x) as usize] != WHITE));
+        assert!(inked, "CAPTURE label painted");
+        assert!(crate::ui_gfx::text_width("CAPTURE", CAPTURE_SCALE) <= CAPTURE_W - 16);
+    }
+    #[test]
+    fn folder_header_is_shown_whole_with_sync_on() {
+        let g = panel_geo();
+        let mut st = HomeState::selecting(0, 3);
+        st.sync = true;
+        let title = "Amazon Books";
+        assert_eq!(title.chars().count(), 12);
+        let rows = plain_rows(3);
+        let inside = HomeLayout::for_rows(&g, &st, &rows, true);
+        assert_eq!(folder_header_text(title, inside.search), title);
+        // The tiles are absent inside a folder and never hit.
+        assert_eq!(inside.today_button.w, 0);
+        assert_eq!(inside.capture_button.w, 0);
+        assert_eq!(inside.search.right() + BAR_GAP, inside.sync_button.x);
+        let main = HomeLayout::for_rows(&g, &st, &rows, false);
+        let c = |r: Rect| UiPoint {
+            x: r.x + r.w / 2,
+            y: r.y + r.h / 2,
+        };
+        for r in [main.today_button, main.capture_button] {
+            let hit = inside.hit(c(r), &st, 3);
+            assert!(
+                !matches!(hit, Some(HomeHit::Today) | Some(HomeHit::Capture)),
+                "{hit:?}"
+            );
+        }
+        // On the main list the tiles are still there.
+        assert_eq!(main.hit(c(main.today_button), &st, 3), Some(HomeHit::Today));
+        assert_eq!(
+            main.hit(c(main.capture_button), &st, 3),
+            Some(HomeHit::Capture)
+        );
     }
 }

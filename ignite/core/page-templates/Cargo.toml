@@ -1,0 +1,13 @@
+[package]
+name = "page-templates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Parametric gray8 page-background templates for the Kindle Scribe panel"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

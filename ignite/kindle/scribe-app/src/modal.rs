@@ -4,6 +4,7 @@
 use kindle_platform::FbGeometry;
 
 use crate::keyboard::TitleEditor;
+use crate::templates::TemplateId;
 use crate::ui_gfx::{wrap_text, Canvas, Rect, UiPoint, BLACK, GRAY, WHITE};
 
 const BOX_MARGIN_X: u32 = 120;
@@ -44,6 +45,21 @@ pub enum TitlePurpose {
 /// Folder buttons shown per picker page (PREVIOUS/NEXT page through the rest).
 pub const PICKER_PAGE: usize = 5;
 
+/// Suffix marking the preselected (last used) template in the picker.
+pub const TEMPLATE_SELECTED_MARK: &str = " *";
+
+/// What the template picker's choice is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickerPurpose {
+    /// The title was entered; create the notebook (filed in `folder_id` when set).
+    NewNotebook {
+        title: String,
+        folder_id: Option<String>,
+    },
+    /// Page menu: insert a page after the current one.
+    InsertPage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     /// Notebook menu on the main list (the notebook is in no folder).
@@ -83,6 +99,16 @@ pub enum Modal {
     ConfirmDeleteNotebook {
         notebook_id: String,
         title: String,
+    },
+    /// Choose a page template: `options` are `(id, display name)`, paged like
+    /// [`Modal::FolderPicker`]. `selected` is the last used one (marked); `unreadable` lists
+    /// option indices shown disabled (custom PNGs that failed to load).
+    TemplatePicker {
+        purpose: PickerPurpose,
+        options: Vec<(TemplateId, String)>,
+        selected: usize,
+        page: usize,
+        unreadable: Vec<usize>,
     },
     TitleEntry {
         purpose: TitlePurpose,
@@ -152,6 +178,14 @@ impl Modal {
         }
     }
 
+    /// TODAY (or open-at-launch Today) while the device clock looks unset.
+    pub fn clock_unset_notice() -> Self {
+        Self::Notice {
+            heading: "Clock not set".into(),
+            body: vec!["Set the Kindle clock first.".into()],
+        }
+    }
+
     /// COPY TO IGNITE on a mirror whose Kindle source was already imported.
     pub fn already_copied_notice() -> Self {
         Self::Notice {
@@ -184,6 +218,8 @@ pub enum ButtonId {
     Rename,
     DeleteNotebook,
     InsertPageAfter,
+    /// Page menu: insert a page after the current one, choosing its template.
+    InsertPageWithTemplate,
     MovePageLeft,
     MovePageRight,
     DeletePage,
@@ -198,6 +234,8 @@ pub enum ButtonId {
     DeleteFolder,
     /// Index into the picker's `options`.
     PickFolder(usize),
+    /// Index into the template picker's `options`.
+    PickTemplate(usize),
     PickerPrevious,
     PickerNext,
     Jump,
@@ -245,6 +283,22 @@ fn card_menu_buttons(mirror: bool, rest: Vec<DialogButton>) -> Vec<DialogButton>
             .filter(|b| matches!(b.id, ButtonId::DeleteNotebook | ButtonId::Cancel)),
     );
     buttons
+}
+
+/// PREVIOUS/NEXT (when the options span several pages) and CANCEL for a paged picker showing
+/// options `start..end` of `len`.
+fn push_picker_nav(buttons: &mut Vec<DialogButton>, start: usize, end: usize, len: usize) {
+    if len > PICKER_PAGE {
+        buttons.push(DialogButton {
+            enabled: start > 0,
+            ..button(ButtonId::PickerPrevious, "PREVIOUS")
+        });
+        buttons.push(DialogButton {
+            enabled: end < len,
+            ..button(ButtonId::PickerNext, "NEXT")
+        });
+    }
+    buttons.push(button(ButtonId::Cancel, "CANCEL"));
 }
 
 /// Dialog content for every modal except the full-screen title editor.
@@ -324,19 +378,42 @@ pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
                 .enumerate()
                 .map(|(k, (_, name))| button(ButtonId::PickFolder(start + k), name))
                 .collect();
-            if options.len() > PICKER_PAGE {
-                buttons.push(DialogButton {
-                    enabled: start > 0,
-                    ..button(ButtonId::PickerPrevious, "PREVIOUS")
-                });
-                buttons.push(DialogButton {
-                    enabled: end < options.len(),
-                    ..button(ButtonId::PickerNext, "NEXT")
-                });
-            }
-            buttons.push(button(ButtonId::Cancel, "CANCEL"));
+            push_picker_nav(&mut buttons, start, end, options.len());
             DialogSpec {
                 heading: format!("Move \"{title}\" to"),
+                body: Vec::new(),
+                buttons,
+                vertical: true,
+            }
+        }
+        Modal::TemplatePicker {
+            options,
+            selected,
+            page,
+            unreadable,
+            ..
+        } => {
+            let start = (page * PICKER_PAGE).min(options.len());
+            let end = (start + PICKER_PAGE).min(options.len());
+            let mut buttons: Vec<DialogButton> = options[start..end]
+                .iter()
+                .enumerate()
+                .map(|(k, (_, name))| {
+                    let i = start + k;
+                    let label = if i == *selected {
+                        format!("{name}{TEMPLATE_SELECTED_MARK}")
+                    } else {
+                        name.clone()
+                    };
+                    DialogButton {
+                        enabled: !unreadable.contains(&i),
+                        ..button(ButtonId::PickTemplate(i), &label)
+                    }
+                })
+                .collect();
+            push_picker_nav(&mut buttons, start, end, options.len());
+            DialogSpec {
+                heading: "Choose a template".into(),
                 body: Vec::new(),
                 buttons,
                 vertical: true,
@@ -362,6 +439,10 @@ pub fn dialog_spec(modal: &Modal) -> Option<DialogSpec> {
             body: Vec::new(),
             buttons: vec![
                 button(ButtonId::InsertPageAfter, "INSERT PAGE AFTER"),
+                button(
+                    ButtonId::InsertPageWithTemplate,
+                    "INSERT PAGE WITH TEMPLATE",
+                ),
                 DialogButton {
                     enabled: *page_number > 1,
                     ..button(ButtonId::MovePageLeft, "MOVE PAGE LEFT")

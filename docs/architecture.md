@@ -105,6 +105,69 @@ browser companion.
 - Setting: Preferences → `AMAZON MIRROR` (`mirror_amazon` in replica-local
   `preferences.json`, default on). Tools shows status and `RESCAN NOW`.
 
+### Templates
+
+Nine built-in page backgrounds are rendered on the device from parameters:
+`blank`, `lined`, `dot_grid`, `graph`, `cornell`, `daily`, `weekly`,
+`isometric`, `music_staff`.
+
+- Custom templates are PNG files the owner copies over USB to
+  `<library root>/templates/custom/` (the library root is `--data-dir`,
+  default `/mnt/us/scribe-data`). Any PNG colour type works; it is converted to
+  grayscale, letterboxed into the page's safe area and listed by its file name
+  without extension. Unreadable PNGs are listed as unreadable and skipped.
+- Safe rows: the top 130 px under the chrome bar and the bottom 57 px stay
+  white.
+- Cache: one bitmap per template under `templates/cache/` (`<sha256>.gray8`, a
+  thumbnail beside it, and `index.json`). A changed PNG, or an app update that
+  changes a built-in, re-renders.
+- Each page still stores its own background as before; the cache is one
+  bitmap per template, not per page.
+- Picker: the notebook title dialog (from `+ NEW` on Home, top level or inside
+  a folder) is followed by a paged template picker. The choice applies to the
+  first page and, because new pages copy the previous page's background, to
+  every later page. The page menu's `INSERT PAGE WITH TEMPLATE` (next to
+  `INSERT PAGE AFTER`) opens the same picker for the new page.
+- The last-used template is remembered (`preferences.json` key `template`,
+  default `blank`) and preselected, marked with ` *`.
+- A load failure shows `That template couldn't be loaded.` and creates nothing.
+- Sync and the browser need nothing new: a template is an ordinary page
+  background blob.
+
+### Reserved notebooks and text stamps
+
+Two notebooks are created and tracked by the app; both are ordinary notebooks
+that sync normally.
+
+- Daily: a folder titled `Daily` holds one notebook per month titled
+  `Daily 2026-10` (year-month). `TODAY` on Home opens today's page; each day's
+  page is appended after the previous day's, and a new month's first page is
+  that day's page. Dates come from the Kindle's clock and local time zone; a
+  clock reading before 2025 shows `Clock not set` and creates nothing.
+- Each day page is stamped at the top with the date as typed text (`Sunday 25
+  October 2026`), so it is real text in the browser companion.
+- Ledger: `<library root>/.scribe-daily/daily.json` tracks the folder, month
+  notebooks and day pages by id. Either may be renamed. A deleted month
+  notebook is recreated at the next `TODAY`, a deleted `Daily` folder at the
+  next month. The folder and the day-page ledger are replica-local. A corrupt
+  `daily.json` shows an error and creates nothing.
+- Inbox: `CAPTURE` on Home, or the `Capture` side-button action, opens a fresh
+  page in a top-level notebook titled `Inbox` (created on first use), stamped
+  with the time (`Sun 25 Oct 17:40`; skipped when the clock is unset).
+  Tracked by id in `<library root>/.scribe-capture/capture.json`.
+- Gesture: with the side-button action set to `Capture`, pressing the pen's side
+  button and touching the page jumps to a fresh Inbox page. The same gesture on
+  that Inbox page returns to the notebook and page you came from, or to Home
+  when the capture started there.
+- Leaving a capture page discards it if nothing was written, it has no links
+  and no text beyond the stamp, and it is not the Inbox's only page. Other
+  Inbox pages are never touched.
+- Kindle-authored text: the two stamps are the first text objects authored on
+  the device. They sync through the existing text operation and are
+  display-only on the Kindle (no editing there).
+- Preferences: `OPEN AT LAUNCH` (`Home` default, or `Today`; key
+  `open_at_launch`) and `SIDE BUTTON` (`Nav + undo`, `New link`, `Capture`).
+
 ## Sync and operation envelopes
 
 Outbound/inbound sync uses versioned operation envelopes. A self-hosted

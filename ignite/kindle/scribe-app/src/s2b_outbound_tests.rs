@@ -31,8 +31,8 @@ use crate::notebook::{
 use crate::pressure_curve::STYLE_PRESSURE_WIDTH_V1;
 use crate::profile::RenderProfile;
 use crate::store::{
-    load_existing_page, load_page_links, page_dir, write_page_links, PageStore,
-    PersistedFragmentV2, PersistedPointV1, PersistedReplacementV2,
+    load_existing_page, load_page_links, load_page_texts, page_dir, write_page_links,
+    write_page_texts, PageStore, PersistedFragmentV2, PersistedPointV1, PersistedReplacementV2,
 };
 use crate::sync_local::{build_snapshot, read_identity, SYNC_DIR};
 use crate::ui_gfx::paper_background;
@@ -887,6 +887,77 @@ fn trailing_add_page_link_prep_is_aborted_when_the_local_link_never_landed() {
     assert!(s.fault().is_none(), "{:?}", s.fault());
     assert_eq!(s.pending(), 0);
     assert!(load_page_links(&source_page_dir(&e.lib))
+        .unwrap()
+        .is_empty());
+    write(
+        &s,
+        &e.lib,
+        "notebook-1",
+        "page-1",
+        &[(30.0, 30.0), (40.0, 40.0)],
+    );
+    wait_until("journal", Duration::from_secs(5), || s.pending() == 1);
+    stop(s);
+    assert_eq!(pending_seqs(&e.sync), [1]);
+    assert_eq!(replay_local(&e.sync).snapshot, local_snapshot(&e.lib));
+}
+
+fn stamp_text() -> sync_protocol::SyncText {
+    sync_protocol::SyncText {
+        text_id: sync_protocol::TextId::from_uuid(Uuid::now_v7()).unwrap(),
+        x: crate::text_author::STAMP_X,
+        y: crate::text_author::STAMP_Y,
+        width: 1000.0,
+        font_size: crate::text_author::STAMP_FONT_SIZE,
+        face: sync_protocol::TextFace::DefaultSansV1,
+        content: "Sun 25 Oct 09:30".into(),
+    }
+}
+
+#[test]
+fn trailing_add_text_prep_is_committed_and_replays_exactly() {
+    let e = env("text-add-commit");
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let text = stamp_text();
+    let dir = source_page_dir(&e.lib);
+    let t = s.prepare_add_text("notebook-1", "page-1", &text).unwrap();
+    write_page_texts(&dir, std::slice::from_ref(&text)).unwrap();
+    drop(t);
+    drop(s);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    assert_eq!(s.pending(), 1);
+    stop(s);
+    let kinds: Vec<&str> = parse_journal(&fs::read(e.sync.join(OUTBOX_FILE)).unwrap())
+        .unwrap()
+        .committed
+        .iter()
+        .map(|o| op_kind(&o.envelope.operation))
+        .collect();
+    assert_eq!(kinds, ["add_text"]);
+    let local = local_snapshot(&e.lib);
+    assert!(
+        local.notebooks.iter().any(|n| n
+            .pages
+            .iter()
+            .any(|p| p.texts.iter().any(|x| x.text_id == text.text_id))),
+        "the local snapshot carries the page text"
+    );
+    assert_eq!(replay_local(&e.sync).snapshot, local);
+}
+
+#[test]
+fn trailing_add_text_prep_is_aborted_and_replays_exactly() {
+    let e = env("text-add-abort");
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    let text = stamp_text();
+    let t = s.prepare_add_text("notebook-1", "page-1", &text).unwrap();
+    drop(t);
+    drop(s);
+    let s = OutboundSync::open(&e.lib, &e.sync).unwrap();
+    assert!(s.fault().is_none(), "{:?}", s.fault());
+    assert_eq!(s.pending(), 0);
+    assert!(load_page_texts(&source_page_dir(&e.lib))
         .unwrap()
         .is_empty());
     write(
