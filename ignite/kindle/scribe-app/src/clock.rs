@@ -22,8 +22,21 @@ const MONTHS: [&str; 12] = [
     "October", "November", "December",
 ];
 
-/// Current local time, or `None` when the clock looks unset.
+#[cfg(unix)]
+extern "C" {
+    // POSIX; not exported by the libc crate on every target.
+    fn tzset();
+}
+
+/// Current local time, or `None` when the clock looks unset. The zone is re-read first, so
+/// a time-zone change made while Ignite runs is honoured (glibc otherwise reads it once).
 pub fn now_local() -> Option<LocalDateTime> {
+    // SAFETY: tzset has no preconditions; it only re-reads TZ / the zone file into libc's
+    // process-global zone state, which `localtime_r` then reads.
+    #[cfg(unix)]
+    unsafe {
+        tzset()
+    };
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
