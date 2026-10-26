@@ -77,7 +77,7 @@ fn synth_notebook(out: &Path, pages: usize, strokes_per_page: usize) {
     drop(store);
     for p in 2..=pages {
         let id = allocate_page_id(&man);
-        let (mut s, _) = create_page_files_from_template(out, &id, "page-1").unwrap();
+        let (mut s, _) = create_page_files_from_template(out, &id, "page-1", None).unwrap();
         for i in 0..strokes_per_page {
             s.append_committed_stroke(&stroke(&format!("s-p{p}-{i}"), i))
                 .unwrap();
