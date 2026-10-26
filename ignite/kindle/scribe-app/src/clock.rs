@@ -15,11 +15,27 @@ pub struct LocalDateTime {
 }
 
 const WEEKDAYS: [&str; 7] = [
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
 ];
 const MONTHS: [&str; 12] = [
-    "January", "February", "March", "April", "May", "June", "July", "August", "September",
-    "October", "November", "December",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
 ];
 
 #[cfg(unix)]
@@ -125,7 +141,10 @@ mod tests {
     fn formats_match_the_spec_for_a_known_instant() {
         use_utc();
         let d = local_from_unix(1_792_950_000).expect("trusted year");
-        assert_eq!((d.year, d.month, d.day, d.weekday, d.hour, d.minute), (2026, 10, 25, 0, 17, 40));
+        assert_eq!(
+            (d.year, d.month, d.day, d.weekday, d.hour, d.minute),
+            (2026, 10, 25, 0, 17, 40)
+        );
         assert_eq!(ymd(&d), "2026-10-25");
         assert_eq!(ym(&d), "2026-10");
         assert_eq!(long_date(&d), "Sunday 25 October 2026");

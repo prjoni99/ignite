@@ -38,15 +38,54 @@ pub struct Builtin {
 }
 
 pub const BUILTINS: &[Builtin] = &[
-    Builtin { id: "blank", name: "Blank", spec: TemplateSpec::Blank },
-    Builtin { id: "lined", name: "Lined", spec: TemplateSpec::Lined { spacing_px: LINED_SPACING, margin_px: LINED_MARGIN } },
-    Builtin { id: "dot_grid", name: "Dot grid", spec: TemplateSpec::DotGrid { pitch_px: 60 } },
-    Builtin { id: "graph", name: "Graph", spec: TemplateSpec::Graph { pitch_px: 60 } },
-    Builtin { id: "cornell", name: "Cornell", spec: TemplateSpec::Cornell },
-    Builtin { id: "daily", name: "Daily", spec: TemplateSpec::Daily },
-    Builtin { id: "weekly", name: "Weekly", spec: TemplateSpec::Weekly },
-    Builtin { id: "isometric", name: "Isometric", spec: TemplateSpec::Isometric { pitch_px: 80 } },
-    Builtin { id: "music_staff", name: "Music staff", spec: TemplateSpec::MusicStaff },
+    Builtin {
+        id: "blank",
+        name: "Blank",
+        spec: TemplateSpec::Blank,
+    },
+    Builtin {
+        id: "lined",
+        name: "Lined",
+        spec: TemplateSpec::Lined {
+            spacing_px: LINED_SPACING,
+            margin_px: LINED_MARGIN,
+        },
+    },
+    Builtin {
+        id: "dot_grid",
+        name: "Dot grid",
+        spec: TemplateSpec::DotGrid { pitch_px: 60 },
+    },
+    Builtin {
+        id: "graph",
+        name: "Graph",
+        spec: TemplateSpec::Graph { pitch_px: 60 },
+    },
+    Builtin {
+        id: "cornell",
+        name: "Cornell",
+        spec: TemplateSpec::Cornell,
+    },
+    Builtin {
+        id: "daily",
+        name: "Daily",
+        spec: TemplateSpec::Daily,
+    },
+    Builtin {
+        id: "weekly",
+        name: "Weekly",
+        spec: TemplateSpec::Weekly,
+    },
+    Builtin {
+        id: "isometric",
+        name: "Isometric",
+        spec: TemplateSpec::Isometric { pitch_px: 80 },
+    },
+    Builtin {
+        id: "music_staff",
+        name: "Music staff",
+        spec: TemplateSpec::MusicStaff,
+    },
 ];
 
 const LINED_SPACING: u32 = 94;
@@ -98,12 +137,19 @@ impl Canvas {
 }
 
 pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
-    let mut c = Canvas { px: vec![WHITE; w as usize * h as usize], w, h };
+    let mut c = Canvas {
+        px: vec![WHITE; w as usize * h as usize],
+        w,
+        h,
+    };
     let top = SAFE_TOP;
     let bottom = h.saturating_sub(SAFE_BOTTOM);
     match *spec {
         TemplateSpec::Blank => {}
-        TemplateSpec::Lined { spacing_px, margin_px } => {
+        TemplateSpec::Lined {
+            spacing_px,
+            margin_px,
+        } => {
             c.lined(top.saturating_add(spacing_px), spacing_px, margin_px);
         }
         TemplateSpec::DotGrid { pitch_px } => {
@@ -170,7 +216,13 @@ pub fn render(spec: &TemplateSpec, w: u32, h: u32) -> Vec<u8> {
             let mut g = top + STAFF_GROUP_PITCH / 2;
             while g + 4 * STAFF_LINE_GAP < bottom {
                 for i in 0..5 {
-                    c.hline(g + i * STAFF_LINE_GAP, STAFF_MARGIN, w.saturating_sub(STAFF_MARGIN), 1, LINE);
+                    c.hline(
+                        g + i * STAFF_LINE_GAP,
+                        STAFF_MARGIN,
+                        w.saturating_sub(STAFF_MARGIN),
+                        1,
+                        LINE,
+                    );
                 }
                 g += STAFF_GROUP_PITCH;
             }
@@ -200,7 +252,10 @@ pub fn thumbnail(bitmap: &[u8], w: u32, h: u32, factor: u32) -> Vec<u8> {
             let mut sum = 0u64;
             for dy in 0..factor {
                 let row = ((ty * factor + dy) as usize) * w as usize + (tx * factor) as usize;
-                sum += bitmap[row..row + factor as usize].iter().map(|&v| v as u64).sum::<u64>();
+                sum += bitmap[row..row + factor as usize]
+                    .iter()
+                    .map(|&v| v as u64)
+                    .sum::<u64>();
             }
             out.push(((sum + n / 2) / n) as u8);
         }
@@ -209,5 +264,8 @@ pub fn thumbnail(bitmap: &[u8], w: u32, h: u32, factor: u32) -> Vec<u8> {
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }

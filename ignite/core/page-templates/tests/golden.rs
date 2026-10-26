@@ -5,8 +5,20 @@ fn every_builtin_renders_the_panel_size_and_keeps_the_safe_rows_white() {
     for b in BUILTINS {
         let px = render(&b.spec, PANEL_W, PANEL_H);
         assert_eq!(px.len(), (PANEL_W * PANEL_H) as usize);
-        assert!(px[..(PANEL_W * SAFE_TOP) as usize].iter().all(|&v| v == WHITE), "{}", b.id);
-        assert!(px[((PANEL_H - SAFE_BOTTOM) * PANEL_W) as usize..].iter().all(|&v| v == WHITE), "{}", b.id);
+        assert!(
+            px[..(PANEL_W * SAFE_TOP) as usize]
+                .iter()
+                .all(|&v| v == WHITE),
+            "{}",
+            b.id
+        );
+        assert!(
+            px[((PANEL_H - SAFE_BOTTOM) * PANEL_W) as usize..]
+                .iter()
+                .all(|&v| v == WHITE),
+            "{}",
+            b.id
+        );
     }
 }
 
@@ -15,7 +27,17 @@ fn renders_are_deterministic_and_distinct() {
     let ids: Vec<&str> = BUILTINS.iter().map(|b| b.id).collect();
     assert_eq!(
         ids,
-        ["blank", "lined", "dot_grid", "graph", "cornell", "daily", "weekly", "isometric", "music_staff"]
+        [
+            "blank",
+            "lined",
+            "dot_grid",
+            "graph",
+            "cornell",
+            "daily",
+            "weekly",
+            "isometric",
+            "music_staff"
+        ]
     );
     let mut hashes = Vec::new();
     for b in BUILTINS {
@@ -35,7 +57,10 @@ fn renders_are_deterministic_and_distinct() {
 
 #[test]
 fn lined_puts_rules_at_the_spacing_and_nowhere_else() {
-    let spec = TemplateSpec::Lined { spacing_px: 94, margin_px: 160 };
+    let spec = TemplateSpec::Lined {
+        spacing_px: 94,
+        margin_px: 160,
+    };
     let px = render(&spec, PANEL_W, PANEL_H);
     let w = PANEL_W as usize;
     let row = |y: u32| &px[y as usize * w..(y as usize + 1) * w];
@@ -66,13 +91,19 @@ fn at(px: &[u8], x: u32, y: u32) -> u8 {
     px[(y * PANEL_W + x) as usize]
 }
 fn builtin(id: &str) -> Vec<u8> {
-    render(&BUILTINS.iter().find(|b| b.id == id).unwrap().spec, PANEL_W, PANEL_H)
+    render(
+        &BUILTINS.iter().find(|b| b.id == id).unwrap().spec,
+        PANEL_W,
+        PANEL_H,
+    )
 }
 
 #[test]
 fn daily_has_a_header_rule_at_safe_top_plus_300() {
     let px = builtin("daily");
-    assert!(row_of(&px, SAFE_TOP + 300)[160..(PANEL_W - 160) as usize].iter().all(|&v| v == LINE));
+    assert!(row_of(&px, SAFE_TOP + 300)[160..(PANEL_W - 160) as usize]
+        .iter()
+        .all(|&v| v == LINE));
     assert!(row_of(&px, SAFE_TOP + 299).iter().all(|&v| v == WHITE));
 }
 
@@ -83,7 +114,13 @@ fn cornell_column_and_summary_rule_sit_where_specified() {
     assert_eq!(at(&px, 559, 1000), WHITE);
     let summary = PANEL_H - SAFE_BOTTOM - 420;
     assert!(row_of(&px, summary).iter().all(|&v| v == LINE));
-    assert!(row_of(&px, summary - 1).iter().filter(|&&v| v == LINE).count() == 2);
+    assert!(
+        row_of(&px, summary - 1)
+            .iter()
+            .filter(|&&v| v == LINE)
+            .count()
+            == 2
+    );
 }
 
 #[test]
@@ -91,7 +128,10 @@ fn weekly_has_six_rules_between_seven_equal_bands() {
     let px = builtin("weekly");
     let band = (PANEL_H - SAFE_TOP - SAFE_BOTTOM) / 7;
     for i in 1..7 {
-        assert!(row_of(&px, SAFE_TOP + i * band).iter().all(|&v| v == LINE), "{i}");
+        assert!(
+            row_of(&px, SAFE_TOP + i * band).iter().all(|&v| v == LINE),
+            "{i}"
+        );
     }
     assert!(row_of(&px, SAFE_TOP + band / 2).iter().all(|&v| v == WHITE));
 }
@@ -133,7 +173,10 @@ fn huge_spec_values_do_not_overflow() {
         TemplateSpec::Isometric { pitch_px: u32::MAX },
         TemplateSpec::DotGrid { pitch_px: u32::MAX },
         TemplateSpec::Graph { pitch_px: u32::MAX },
-        TemplateSpec::Lined { spacing_px: u32::MAX, margin_px: u32::MAX },
+        TemplateSpec::Lined {
+            spacing_px: u32::MAX,
+            margin_px: u32::MAX,
+        },
     ] {
         assert_eq!(render(&spec, 300, 400).len(), 300 * 400);
     }
@@ -149,7 +192,10 @@ fn spec_round_trips_through_serde_and_rejects_unknown_fields() {
         serde_json::to_string(&TemplateSpec::DotGrid { pitch_px: 60 }).unwrap(),
         r#"{"kind":"dot_grid","pitch_px":60}"#
     );
-    assert!(serde_json::from_str::<TemplateSpec>(r#"{"kind":"dot_grid","pitch_px":60,"extra":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<TemplateSpec>(r#"{"kind":"dot_grid","pitch_px":60,"extra":1}"#)
+            .is_err()
+    );
 }
 
 #[test]
