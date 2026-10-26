@@ -674,6 +674,13 @@ fn derive_lost_ops(
                     ap.page_id
                 )));
             }
+            // Page texts are write-ahead too (`AddText`): same rule as links.
+            if ep.texts != ap.texts {
+                return Err(what(&format!(
+                    "page {} texts differ (not derivable)",
+                    ap.page_id
+                )));
+            }
             if ep.strokes == ap.strokes {
                 continue;
             }
