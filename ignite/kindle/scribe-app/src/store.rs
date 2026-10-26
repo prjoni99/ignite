@@ -926,6 +926,14 @@ fn edits_path(dir: &Path) -> PathBuf {
     dir.join("edits.jsonl")
 }
 
+/// Strokes ever written to the page in `dir` (every record in `strokes.jsonl`, which deletes
+/// never rewrite), read without any write. An incomplete final record is not counted.
+pub fn ever_written_stroke_count(dir: &Path) -> Result<usize, String> {
+    let raw = fs::read(journal_path(dir))
+        .map_err(|e| format!("REFUSE PAGE READ: {}: {e}", journal_path(dir).display()))?;
+    Ok(parse_stroke_journal(&raw)?.0.len())
+}
+
 /// Durable page text objects. Absent file = no texts.
 pub fn texts_path(dir: &Path) -> PathBuf {
     dir.join("texts.jsonl")

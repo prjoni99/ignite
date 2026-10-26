@@ -3256,8 +3256,9 @@ fn leave_capture_page_if_empty(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Res
 }
 
 /// Resolve (creating as needed) the Inbox and the page this capture writes on: a fresh Inbox
-/// reuses its first page, otherwise a page is appended (each durable write captured for sync).
-/// The page is stamped with the local time when the clock is set.
+/// reuses its first page, an Inbox whose only page is untouched reuses it as it is (stamp
+/// kept, none added), otherwise a page is appended (each durable write captured for sync).
+/// A new or freshly created page is stamped with the local time when the clock is set.
 fn open_capture(
     x: &mut UiExec<'_>,
     ctrl: &mut KindleCtrl,
@@ -3298,7 +3299,37 @@ fn open_capture(
         disk = crate::library::read_notebook_manifest_read_only(&nb_dir)?;
         &mut disk
     };
-    let page_id = match crate::capture::next_capture_page(manifest, created) {
+    // The only page, if untouched, is reused (read from disk: the Inbox may not be bound).
+    let only_page_untouched = !created
+        && match manifest.page_ids.as_slice() {
+            [only] => {
+                let pd = page_dir(&nb_dir, only);
+                match (
+                    crate::store::ever_written_stroke_count(&pd),
+                    crate::store::load_page_links(&pd),
+                    crate::store::load_page_texts(&pd),
+                ) {
+                    (Ok(strokes), Ok(links), Ok(texts)) => {
+                        crate::capture::reuse_only_page(manifest, strokes, links.len(), texts.len())
+                    }
+                    (a, b, c) => {
+                        let detail = [a.err(), b.err(), c.err()]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        eprintln!("capture_reuse_check_failed page={only} detail={detail}");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+    let page_id = match crate::capture::next_capture_page(manifest, created, only_page_untouched) {
+        CapturePage::ReuseUntouched(page_id) => {
+            println!("capture_reused_first_page notebook={notebook_id} page={page_id}");
+            return Ok((notebook_id, page_id, created));
+        }
         CapturePage::ReuseFirst => manifest
             .page_ids
             .first()

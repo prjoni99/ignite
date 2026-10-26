@@ -103,15 +103,36 @@ pub fn resolve_inbox(
 pub enum CapturePage {
     /// A just-created Inbox: its first page is the capture.
     ReuseFirst,
+    /// The Inbox's only page, still untouched (see [`reuse_only_page`]): reused as it is.
+    /// Its stamp is kept and no second one is written.
+    ReuseUntouched(String),
     /// Append after this (the last) page.
     InsertAfter(String),
 }
 
-pub fn next_capture_page(manifest: &PersistedNotebookManifestV1, created: bool) -> CapturePage {
-    match manifest.page_ids.last() {
-        Some(last) if !created => CapturePage::InsertAfter(last.clone()),
-        _ => CapturePage::ReuseFirst,
+/// `only_page_untouched` is [`reuse_only_page`] for the Inbox's page (false when unknown).
+pub fn next_capture_page(
+    manifest: &PersistedNotebookManifestV1,
+    created: bool,
+    only_page_untouched: bool,
+) -> CapturePage {
+    match manifest.page_ids.as_slice() {
+        _ if created => CapturePage::ReuseFirst,
+        [only] if only_page_untouched => CapturePage::ReuseUntouched(only.clone()),
+        [.., last] => CapturePage::InsertAfter(last.clone()),
+        [] => CapturePage::ReuseFirst,
     }
+}
+
+/// The Inbox has exactly one page and it passes the untouched test (no stroke ever written,
+/// no link, at most the one stamp): the next capture reuses it instead of appending.
+pub fn reuse_only_page(
+    manifest: &PersistedNotebookManifestV1,
+    ever_strokes: usize,
+    link_count: usize,
+    text_count: usize,
+) -> bool {
+    manifest.page_ids.len() == 1 && ever_strokes == 0 && link_count == 0 && text_count <= 1
 }
 
 /// The page a capture opened goes away when it is left untouched: no stroke was ever written
