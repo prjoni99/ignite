@@ -6,8 +6,7 @@ use crate::library::{
     RenameNotebookHooks,
 };
 use crate::nbk_test_kit::{geo, Scribe};
-use crate::notebook::{insert_page_after_durable, InsertPageHooks};
-use crate::store::{load_page_texts, page_dir};
+use crate::store::{load_page_read_only, load_page_texts, page_dir};
 use std::cell::Cell;
 
 fn day(year: i32, month: u32, d: u32, weekday: u32) -> LocalDateTime {
@@ -70,12 +69,7 @@ fn today(
                 counts.days.set(counts.days.get() + 1);
                 let dir = lib.notebook_dir(&notebook_id);
                 let mut m = read_notebook_manifest_read_only(&dir)?;
-                let c = insert_page_after_durable(
-                    &dir,
-                    &mut m,
-                    &after_page,
-                    &InsertPageHooks::default(),
-                )?;
+                let c = insert_day_page(lib.root(), &dir, &mut m, &after_page, &geo())?;
                 lib.set_cached_page_count(&notebook_id, m.page_ids.len());
                 Ok(c.inserted_page_id)
             }
@@ -174,6 +168,45 @@ fn today_after_rollover_appends_a_new_page_once() {
     assert_eq!((n.folders.get(), n.months.get(), n.days.get()), (1, 1, 1));
     assert_eq!(page_ids(&s, &nb).len(), 2);
     assert_eq!(stamps(&s, &nb, &p2).len(), 1);
+}
+
+#[test]
+fn a_day_page_is_pinned_to_the_daily_template() {
+    let mut s = Scribe::new();
+    let root = s.lib.root().to_path_buf();
+    let mut folders = FolderStore::open(&root);
+    let mut ledger = DailyLedger::open(&root).unwrap();
+    let n = Counts::default();
+    let (nb, p1, _) = today(&mut s, &mut ledger, &mut folders, &day(2026, 10, 25, 0), &n).unwrap();
+    // A different template inserted after yesterday's page: the last page is now all black.
+    let dir = s.lib.notebook_dir(&nb);
+    let black = vec![0u8; load_page_read_only(&dir, &p1).unwrap().background.len()];
+    let mut m = read_notebook_manifest_read_only(&dir).unwrap();
+    crate::notebook::insert_page_after_with_background(
+        &dir,
+        &mut m,
+        &p1,
+        &black,
+        &crate::notebook::InsertPageHooks::default(),
+    )
+    .unwrap();
+    s.lib.set_cached_page_count(&nb, m.page_ids.len());
+    let (_, p2, created) =
+        today(&mut s, &mut ledger, &mut folders, &day(2026, 10, 26, 1), &n).unwrap();
+    assert!(created);
+    assert_eq!(page_ids(&s, &nb).last(), Some(&p2));
+    let daily = crate::templates::bitmap(
+        &root,
+        &crate::templates::TemplateId::Builtin { id: "daily".into() },
+        &geo(),
+    )
+    .unwrap();
+    let bg = load_page_read_only(&dir, &p2).unwrap().background;
+    assert!(
+        bg != black,
+        "today's page does not copy the previous page's template"
+    );
+    assert!(bg == daily, "today's page is the daily template");
 }
 
 #[test]

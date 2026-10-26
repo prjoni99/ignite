@@ -3536,11 +3536,12 @@ fn open_today(x: &mut UiExec<'_>, ctrl: &mut KindleCtrl) -> Result<TodayOutcome,
                         disk = crate::library::read_notebook_manifest_read_only(&nb_dir)?;
                         &mut disk
                     };
-                let commit = insert_page_after_durable(
+                let commit = crate::daily::insert_day_page(
+                    library.root(),
                     &nb_dir,
                     manifest,
                     &after_page,
-                    &InsertPageHooks::default(),
+                    &geo,
                 )?;
                 library.set_cached_page_count(&notebook_id, manifest.page_ids.len());
                 crate::sync_outbound::with_global(|s| {

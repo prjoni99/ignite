@@ -13,6 +13,12 @@ use crate::clock::{self, LocalDateTime};
 use crate::folders::FolderStore;
 use crate::library::{read_notebook_manifest_read_only, LibraryRepository};
 use crate::nbk_import::write_atomic;
+use crate::notebook::{
+    insert_page_after_durable, insert_page_after_with_background, InsertPageCommit,
+    InsertPageHooks, PersistedNotebookManifestV1,
+};
+use crate::templates::TemplateId;
+use kindle_platform::FbGeometry;
 
 pub const DAILY_DIR: &str = ".scribe-daily";
 pub const DAILY_FILE: &str = "daily.json";
@@ -211,6 +217,33 @@ fn stamp(library: &LibraryRepository, notebook_id: &str, page_id: &str, now: &Lo
     match crate::text_author::stamp_page(&dir, notebook_id, page_id, &clock::long_date(now)) {
         Ok(_) => println!("daily_stamped notebook={notebook_id} page={page_id}"),
         Err(e) => eprintln!("daily_stamp_failed notebook={notebook_id} page={page_id} detail={e}"),
+    }
+}
+
+/// Insert a day page after `after_page`, pinned to the `daily` template (as the month
+/// notebook's first page) rather than copying the previous page's background, so a template
+/// put on yesterday's page does not leak into today. If the template bitmap cannot be loaded,
+/// the previous page's background is copied and `daily_template_fallback` is logged.
+pub fn insert_day_page(
+    library_root: &Path,
+    nb_dir: &Path,
+    manifest: &mut PersistedNotebookManifestV1,
+    after_page: &str,
+    geo: &FbGeometry,
+) -> Result<InsertPageCommit, String> {
+    let daily = TemplateId::Builtin { id: "daily".into() };
+    match crate::templates::bitmap(library_root, &daily, geo) {
+        Ok(paper) => insert_page_after_with_background(
+            nb_dir,
+            manifest,
+            after_page,
+            &paper,
+            &InsertPageHooks::default(),
+        ),
+        Err(e) => {
+            println!("daily_template_fallback after={after_page} detail={e}");
+            insert_page_after_durable(nb_dir, manifest, after_page, &InsertPageHooks::default())
+        }
     }
 }
 
